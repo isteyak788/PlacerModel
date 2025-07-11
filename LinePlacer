@@ -1,0 +1,594 @@
+// Assets/Scripts/LinePlacer.cs
+using UnityEngine;
+using System.Collections.Generic;
+using System.Linq; // Required for .Last() extension method
+using UnityEngine.UI; // Required for Button
+using TMPro; // Required if you're using TextMeshPro for button text
+using UnityEngine.EventSystems; // Required for IsPointerOverUIObject
+
+public class LinePlacer : MonoBehaviour
+{
+    // Enum to manage the different states of line placement
+    private enum LinePlacementState
+    {
+        Idle,         // Waiting for a button click to select an object, or waiting for first click to start drawing
+        Drawing       // Actively drawing the polyline (after first click, before Enter)
+    }
+
+    private LinePlacementState currentState = LinePlacementState.Idle;
+
+    [System.Serializable]
+    public class PlaceableObjectEntry
+    {
+        [Tooltip("The GameObject prefab to be placed along the line.")]
+        public GameObject objectPrefab;
+        [Tooltip("The UI Button that, when clicked, starts placing this object.")]
+        public Button placementButton;
+    }
+
+    [Header("Placeable Objects & Controls")]
+    [Tooltip("Define each object you want to place and its corresponding UI button.")]
+    public PlaceableObjectEntry[] placeableObjects;
+
+    [Header("Global Placement Settings")]
+    [Tooltip("The LayerMask for terrain or ground objects to raycast against for placement.")]
+    public LayerMask placementLayerMask;
+    [Tooltip("The material to use for valid placement previews.")]
+    public Material validPlacementMaterial;
+    [Tooltip("The material to use for invalid placement previews.")]
+    public Material invalidPlacementMaterial; // This might not be used if we're not doing live collision checks in this simplified version
+    [Tooltip("The height from which to start the raycast downwards to find the terrain.")]
+    public float terrainRaycastStartHeight = 100f;
+
+    [Header("Line Placement Settings")]
+    [Tooltip("The minimum length a line segment must have to place an object on it.")]
+    public float minSegmentLengthForObject = 0.5f;
+    [Tooltip("Spacing between objects along the line.")]
+    public float objectSpacing = 1.0f; // Directly exposed for setting in inspector
+    [Tooltip("Should objects be rotated 90 degrees to the right of the line direction?")]
+    public bool objectsRotatedRightOfLine = false; // Directly exposed for setting in inspector
+    [Tooltip("How many interpolated points to generate per segment for the curve. Higher value = smoother curve.")]
+    [Range(2, 50)] // Provide a slider in inspector for easy adjustment
+    public int curveResolution = 10; // Default resolution for the curve
+
+    // Internal References for line drawing and previews
+    private LineRenderer lineRenderer;
+    private List<Vector3> linePoints = new List<Vector3>();
+    private List<GameObject> currentObjectPreviews = new List<GameObject>();
+    private Vector3 _mouseWorldPosition;
+    private bool _mouseWorldPositionFound;
+
+    // Current object being placed
+    private GameObject _currentObjectToPlacePrefab;
+    private GameObject _currentObjectPrefabInstanceForBounds; // Temporary instance to get footprint size
+
+    void Awake()
+    {
+        // Get or Add LineRenderer component on this GameObject
+        lineRenderer = GetComponent<LineRenderer>();
+        if (lineRenderer == null)
+        {
+            lineRenderer = gameObject.AddComponent<LineRenderer>();
+            // Set some default LineRenderer properties if it's new
+            lineRenderer.startWidth = 0.1f;
+            lineRenderer.endWidth = 0.1f;
+            lineRenderer.material = new Material(Shader.Find("Sprites/Default")); // Simple default material
+            lineRenderer.startColor = Color.cyan;
+            lineRenderer.endColor = Color.blue;
+        }
+        lineRenderer.enabled = false; // Start disabled
+    }
+
+    void OnEnable()
+    {
+        // Subscribe placement buttons to their respective methods
+        foreach (var entry in placeableObjects)
+        {
+            if (entry.placementButton != null)
+            {
+                // Clear existing listeners to prevent duplicates if OnEnable is called multiple times
+                entry.placementButton.onClick.RemoveAllListeners();
+                // Add new listener to start placement for this specific prefab
+                entry.placementButton.onClick.AddListener(() => StartPlacementForObject(entry.objectPrefab));
+                // Ensure buttons are interactable
+                entry.placementButton.interactable = true;
+            }
+        }
+
+        // Initialize mode
+        ExitLinePlacementMode(); // Ensure we start in a clean idle state
+    }
+
+    void OnDisable()
+    {
+        // Unsubscribe placement buttons
+        foreach (var entry in placeableObjects)
+        {
+            if (entry.placementButton != null)
+            {
+                entry.placementButton.onClick.RemoveAllListeners();
+            }
+        }
+        
+        // Clean up any temporary instance
+        if (_currentObjectPrefabInstanceForBounds != null)
+        {
+            DestroyImmediate(_currentObjectPrefabInstanceForBounds); 
+            _currentObjectPrefabInstanceForBounds = null;
+        }
+
+        ExitLinePlacementMode(); // Clean up visuals when disabled
+    }
+
+    // Called when a placement button is clicked
+    public void StartPlacementForObject(GameObject prefab)
+    {
+        if (prefab == null)
+        {
+            Debug.LogError("Attempted to start placement with a null prefab!");
+            return;
+        }
+
+        // Clean up previous temporary instance if any
+        if (_currentObjectPrefabInstanceForBounds != null)
+        {
+            Destroy(_currentObjectPrefabInstanceForBounds);
+            _currentObjectPrefabInstanceForBounds = null;
+        }
+
+        _currentObjectToPlacePrefab = prefab;
+        
+        // Create a temporary instance of the prefab to get its bounds
+        _currentObjectPrefabInstanceForBounds = Instantiate(_currentObjectToPlacePrefab, Vector3.zero, Quaternion.identity);
+        _currentObjectPrefabInstanceForBounds.hideFlags = HideFlags.HideAndDontSave; // Hide from hierarchy and don't save
+        _currentObjectPrefabInstanceForBounds.SetActive(false); // Keep it hidden
+
+        currentState = LinePlacementState.Idle; // Re-enter idle state, waiting for the first click for this new object
+        linePoints.Clear(); // Clear any previous line points
+        ClearObjectPreviews(); // Clear any previous object previews
+
+        // Enable and reset LineRenderer for new line drawing
+        if (lineRenderer != null)
+        {
+            lineRenderer.positionCount = 0;
+            lineRenderer.enabled = true;
+        }
+
+        // Disable all placement buttons while in placement mode
+        SetPlacementButtonsInteractable(false);
+
+        Debug.Log($"Started placing: {_currentObjectToPlacePrefab.name}. Click to draw points. Press Enter to finalize. Right Click to cancel.");
+    }
+
+    // Called to deactivate the line placement mode
+    public void ExitLinePlacementMode()
+    {
+        currentState = LinePlacementState.Idle; // Reset to idle state
+        _currentObjectToPlacePrefab = null; // Clear selected prefab
+        linePoints.Clear(); // Clear all line points
+        ClearObjectPreviews(); // Clear all object previews
+
+        // Disable and reset LineRenderer
+        if (lineRenderer != null)
+        {
+            lineRenderer.positionCount = 0;
+            lineRenderer.enabled = false;
+        }
+
+        // Destroy the temporary instance used for bounds
+        if (_currentObjectPrefabInstanceForBounds != null)
+        {
+            Destroy(_currentObjectPrefabInstanceForBounds);
+            _currentObjectPrefabInstanceForBounds = null;
+        }
+
+        // Re-enable all placement buttons
+        SetPlacementButtonsInteractable(true);
+
+        Debug.Log("Line Placement Mode Exited. Select an object to place via buttons.");
+    }
+
+    // Main update loop for the placement mode
+    void Update()
+    {
+        UpdateMouseWorldPosition(); // Update mouse raycast hit position
+
+        // State machine to handle different input behaviors
+        switch (currentState)
+        {
+            case LinePlacementState.Idle:
+                // If a prefab is selected, but no points are started, wait for first click
+                if (_currentObjectToPlacePrefab != null)
+                {
+                    HandleFirstPointInput();
+                }
+                // Otherwise, we are truly idle, waiting for a button click
+                break;
+            case LinePlacementState.Drawing:
+                HandleDrawingInput();
+                break;
+        }
+
+        // Always update line renderer and object previews in Drawing state
+        if (currentState == LinePlacementState.Drawing)
+        {
+            UpdateLineRenderer();
+            UpdateObjectPreviews();
+        }
+        else // If currentState is Idle (and no drawing is in progress), ensure visual aids are off
+        {
+            if (lineRenderer != null) lineRenderer.positionCount = 0;
+            ClearObjectPreviews();
+        }
+    }
+
+    // Helper to get mouse world position
+    private void UpdateMouseWorldPosition()
+    {
+        Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
+        if (Physics.Raycast(ray, out RaycastHit hit, Mathf.Infinity, placementLayerMask))
+        {
+            _mouseWorldPosition = hit.point;
+            _mouseWorldPositionFound = true;
+        }
+        else
+        {
+            _mouseWorldPositionFound = false;
+        }
+    }
+
+    // Check if the pointer is over a UI object
+    private bool IsPointerOverUIObject()
+    {
+        PointerEventData eventDataCurrentPosition = new PointerEventData(EventSystem.current);
+        eventDataCurrentPosition.position = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+        List<RaycastResult> results = new List<RaycastResult>();
+        EventSystem.current.RaycastAll(eventDataCurrentPosition, results);
+        return results.Count > 0;
+    }
+
+    // Handles input when in the Idle state (after prefab selected, waiting for first point)
+    private void HandleFirstPointInput()
+    {
+        if (Input.GetMouseButtonDown(0) && !IsPointerOverUIObject())
+        {
+            if (_mouseWorldPositionFound)
+            {
+                linePoints.Add(_mouseWorldPosition); // Add the first point
+                currentState = LinePlacementState.Drawing; // Transition to Drawing state
+                Debug.Log("First point placed. Continue clicking to add more points.");
+            }
+        }
+        // Right click to cancel the entire placement process if in Idle (after selecting prefab)
+        else if (Input.GetMouseButtonDown(1) && !IsPointerOverUIObject())
+        {
+            ExitLinePlacementMode();
+        }
+    }
+
+    // Handles input when in the Drawing state (adding points to the line)
+    private void HandleDrawingInput()
+    {
+        // Left click to add subsequent points
+        if (Input.GetMouseButtonDown(0) && !IsPointerOverUIObject())
+        {
+            if (_mouseWorldPositionFound)
+            {
+                // Only add a new point if it's sufficiently far from the last one
+                if (linePoints.Count == 0 || Vector3.Distance(linePoints.Last(), _mouseWorldPosition) > minSegmentLengthForObject)
+                {
+                    linePoints.Add(_mouseWorldPosition);
+                    Debug.Log($"Point {linePoints.Count} added. Current points: {linePoints.Count}. Press Enter to finalize line.");
+                }
+                else
+                {
+                    Debug.Log("Point too close to the previous one. Minimum segment length: " + minSegmentLengthForObject);
+                }
+            }
+        }
+        // Press Enter to finalize the line and place objects
+        else if (Input.GetKeyDown(KeyCode.Return))
+        {
+            if (linePoints.Count >= 2) // A line needs at least two points to be meaningful
+            {
+                PlaceAllObjects(); // Trigger placement
+            }
+            else
+            {
+                Debug.Log("Need at least 2 points to finalize a line for placement.");
+            }
+        }
+        // Right click to undo the last point or cancel drawing entirely
+        else if (Input.GetMouseButtonDown(1) && !IsPointerOverUIObject())
+        {
+            if (linePoints.Count > 1)
+            {
+                linePoints.RemoveAt(linePoints.Count - 1); // Remove last point
+                Debug.Log("Last point removed. Current points: " + linePoints.Count);
+            }
+            else if (linePoints.Count == 1) // If only one point left, clear it and go back to Idle (awaiting first click)
+            {
+                linePoints.Clear();
+                currentState = LinePlacementState.Idle; // Back to waiting for first point
+                Debug.Log("First point cleared. Back to waiting for first point.");
+            }
+            else // No points left (shouldn't happen if linePoints.Count >= 1), or in drawing mode and trying to cancel
+            {
+                ExitLinePlacementMode(); // Cancel entire placement
+                return;
+            }
+        }
+    }
+
+    // Catmull-Rom Spline Interpolation function
+    private Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+    {
+        float t2 = t * t;
+        float t3 = t2 * t;
+
+        return 0.5f * (
+            (2f * p1) +
+            (-p0 + p2) * t +
+            (2f * p0 - 5f * p1 + 4f * p2 - p3) * t2 +
+            (-p0 + 3f * p1 - 3f * p2 + p3) * t3
+        );
+    }
+
+    // Generates a list of curved points from the original input points using Catmull-Rom
+    private List<Vector3> GetCurvedPoints(List<Vector3> inputPoints, int resolutionPerSegment)
+    {
+        List<Vector3> curvedPoints = new List<Vector3>();
+
+        if (inputPoints.Count < 2) // Need at least two points to form a line
+        {
+            return new List<Vector3>(inputPoints); // Return copy of input, no curve possible
+        }
+
+        // Catmull-Rom requires 4 control points (p0, p1, p2, p3) for each segment (interpolates between p1 and p2).
+        // To handle the start and end of the line smoothly, we duplicate the first and last points:
+        List<Vector3> controlPoints = new List<Vector3>(inputPoints);
+        controlPoints.Insert(0, inputPoints[0]); // p0 for first effective segment (input[0]-input[1])
+        controlPoints.Add(inputPoints[inputPoints.Count - 1]); // p3 for last effective segment (input[n-2]-input[n-1])
+
+        // Iterate through segments using the extended control points list
+        for (int i = 0; i < controlPoints.Count - 3; i++)
+        {
+            Vector3 p0 = controlPoints[i];
+            Vector3 p1 = controlPoints[i + 1];
+            Vector3 p2 = controlPoints[i + 2];
+            Vector3 p3 = controlPoints[i + 3];
+
+            for (int j = 0; j <= resolutionPerSegment; j++)
+            {
+                float t = (float)j / resolutionPerSegment;
+                Vector3 interpolatedPoint = CatmullRom(p0, p1, p2, p3, t);
+                
+                // Add points, ensuring no immediate duplicates from previous segment's end point
+                if (curvedPoints.Count == 0 || Vector3.Distance(curvedPoints.Last(), interpolatedPoint) > 0.0001f)
+                {
+                    curvedPoints.Add(interpolatedPoint);
+                }
+            }
+        }
+        
+        // Ensure the very last original point is accurately included,
+        // as floating point arithmetic might cause slight deviations.
+        if (inputPoints.Count > 0 && (curvedPoints.Count == 0 || Vector3.Distance(curvedPoints.Last(), inputPoints.Last()) > 0.0001f))
+        {
+            curvedPoints.Add(inputPoints.Last());
+        }
+
+        return curvedPoints;
+    }
+
+    // Updates the visual LineRenderer based on current line points
+    private void UpdateLineRenderer()
+    {
+        if (lineRenderer == null) return;
+
+        List<Vector3> pointsForCurveGeneration = new List<Vector3>(linePoints);
+        // If in Drawing state, add the current mouse position to show a live segment to the mouse
+        if (currentState == LinePlacementState.Drawing && _mouseWorldPositionFound && linePoints.Count > 0)
+        {
+            pointsForCurveGeneration.Add(_mouseWorldPosition);
+        }
+
+        // Generate the curved points to be drawn by the LineRenderer
+        List<Vector3> curvedPoints = GetCurvedPoints(pointsForCurveGeneration, curveResolution);
+
+        if (curvedPoints.Count > 0)
+        {
+            lineRenderer.positionCount = curvedPoints.Count;
+            lineRenderer.SetPositions(curvedPoints.ToArray());
+        }
+        else
+        {
+            lineRenderer.positionCount = 0; // Hide the line if there are no points to draw
+        }
+    }
+
+    // Updates the visual object previews along the drawn curved line
+    private void UpdateObjectPreviews()
+    {
+        ClearObjectPreviews(); // Always clear existing previews before generating new ones
+
+        if (_currentObjectToPlacePrefab == null || _currentObjectPrefabInstanceForBounds == null || linePoints.Count < 1) return; // No prefab or no line points, no previews
+
+        List<Vector3> pointsForCurveGeneration = new List<Vector3>(linePoints);
+        // Include the current mouse position for live preview during the drawing phase
+        if (currentState == LinePlacementState.Drawing && _mouseWorldPositionFound && linePoints.Count > 0)
+        {
+            pointsForCurveGeneration.Add(_mouseWorldPosition);
+        }
+
+        // Generate the curved path points
+        List<Vector3> curvedPath = GetCurvedPoints(pointsForCurveGeneration, curveResolution);
+
+        if (curvedPath.Count < 2) return; // Need at least two points to form a path for placement
+
+        // Determine the size of the object for spacing calculations
+        Bounds prefabBounds = new Bounds();
+        Renderer prefabRenderer = _currentObjectPrefabInstanceForBounds.GetComponentInChildren<Renderer>();
+        if (prefabRenderer != null)
+        {
+            // Calculate the total bounds of the prefab, including all its children
+            prefabBounds = CalculateBounds(_currentObjectPrefabInstanceForBounds);
+        }
+        else
+        {
+            Debug.LogWarning("Object to place has no Renderer component, cannot determine its size for spacing. Using default value.");
+            prefabBounds.size = Vector3.one; // Fallback to a default size
+        }
+
+        float objectLength = prefabBounds.size.z;
+        float objectWidth = prefabBounds.size.x;
+        float effectiveObjectSize = objectLength + objectSpacing; // Total space each object occupies
+
+        float currentPathDistance = 0f;
+        // Start placing the first object at half its effective size from the start of the path
+        float nextObjectDistanceTarget = effectiveObjectSize / 2f; 
+
+        // Iterate through the generated curved path segments
+        for (int i = 0; i < curvedPath.Count - 1; i++)
+        {
+            Vector3 currentPoint = curvedPath[i];
+            Vector3 nextPoint = curvedPath[i + 1];
+            float segmentLength = Vector3.Distance(currentPoint, nextPoint);
+
+            // While the accumulated distance plus the current segment's length is enough to reach the next object target
+            while (currentPathDistance + segmentLength >= nextObjectDistanceTarget)
+            {
+                // Calculate the exact position of the object on the current segment
+                float distanceIntoSegment = nextObjectDistanceTarget - currentPathDistance;
+                Vector3 previewPosition = Vector3.Lerp(currentPoint, nextPoint, distanceIntoSegment / segmentLength);
+
+                // Determine the forward direction for the object's rotation (tangent to the curve)
+                Vector3 direction = (nextPoint - currentPoint).normalized;
+                // Fallback if segment is zero length (should be rare with good resolution)
+                if (direction == Vector3.zero && i > 0)
+                {
+                    direction = (currentPoint - curvedPath[i-1]).normalized;
+                }
+                if (direction == Vector3.zero) direction = Vector3.forward; // Last resort default
+
+                // Raycast downwards to get the correct Y position on the terrain
+                RaycastHit hit;
+                if (RaycastToTerrain(previewPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                {
+                    previewPosition = hit.point; // Set Y to terrain height
+                }
+                else
+                {
+                    // If no terrain is found below, we cannot place this object at this spot.
+                    // Advance the target distance to try placing the *next* object.
+                    nextObjectDistanceTarget += effectiveObjectSize;
+                    continue; // Skip to the next iteration of the while loop
+                }
+
+                // Calculate object rotation: initially aligned with the curve tangent
+                Quaternion objectRotation = Quaternion.LookRotation(direction);
+
+                // Apply rotation adjustment if 'objectsRotatedRightOfLine' is true
+                if (objectsRotatedRightOfLine)
+                {
+                    // Rotate 90 degrees around Y (vertical axis) relative to the direction.
+                    // This makes the object's "forward" perpendicular to the line.
+                    objectRotation *= Quaternion.Euler(0, 90, 0);
+
+                    // Also apply an offset perpendicular to the line to place it to the side
+                    // This moves the object half its width away from the center line.
+                    Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
+                    previewPosition += perpendicularOffset;
+                }
+
+                // Instantiate the preview GameObject
+                GameObject preview = Instantiate(_currentObjectToPlacePrefab, previewPosition, objectRotation);
+                currentObjectPreviews.Add(preview);
+
+                // Set the material of the preview
+                SetPreviewMaterial(preview, validPlacementMaterial); // Simplified: always valid for preview in this version
+
+                // Advance the target distance for the next object placement
+                nextObjectDistanceTarget += effectiveObjectSize;
+            }
+            currentPathDistance += segmentLength; // Accumulate distance for the next path segment
+        }
+    }
+
+    // Destroys all current object preview GameObjects
+    private void ClearObjectPreviews()
+    {
+        foreach (GameObject preview in currentObjectPreviews)
+        {
+            Destroy(preview);
+        }
+        currentObjectPreviews.Clear();
+    }
+
+    // Raycast to terrain helper
+    private bool RaycastToTerrain(Vector3 origin, out RaycastHit hit, LayerMask layerMask)
+    {
+        return Physics.Raycast(origin, Vector3.down, out hit, Mathf.Infinity, layerMask);
+    }
+
+    // Sets the material of a GameObject, applying to all its renderers
+    private void SetPreviewMaterial(GameObject obj, Material material)
+    {
+        Renderer[] renderers = obj.GetComponentsInChildren<Renderer>();
+        foreach (Renderer r in renderers)
+        {
+            r.material = material;
+        }
+    }
+
+    // Helper to calculate the total bounds of a GameObject including all its children.
+    private Bounds CalculateBounds(GameObject obj)
+    {
+        Renderer[] renderers = obj.GetComponentsInChildren<Renderer>();
+        if (renderers.Length == 0)
+        {
+            return new Bounds(obj.transform.position, Vector3.one); // Fallback if no renderers
+        }
+
+        Bounds bounds = new Bounds(renderers[0].bounds.center, renderers[0].bounds.size);
+        for (int i = 1; i < renderers.Length; i++)
+        {
+            bounds.Encapsulate(renderers[i].bounds);
+        }
+        return bounds;
+    }
+
+
+    // Places all objects in the scene based on the current previews
+    private void PlaceAllObjects()
+    {
+        if (_currentObjectToPlacePrefab == null)
+        {
+            Debug.LogWarning("No object selected to place.");
+            ExitLinePlacementMode();
+            return;
+        }
+
+        int placedCount = 0;
+        foreach (GameObject preview in currentObjectPreviews)
+        {
+            // Instantiate the final object using the original prefab
+            Instantiate(_currentObjectToPlacePrefab, preview.transform.position, preview.transform.rotation);
+            placedCount++;
+        }
+        Debug.Log($"Line placement finished! Placed {placedCount} {_currentObjectToPlacePrefab.name}(s).");
+        ExitLinePlacementMode(); // Exit the entire placement mode
+    }
+
+    // Helper to enable/disable all placement buttons
+    private void SetPlacementButtonsInteractable(bool interactable)
+    {
+        foreach (var entry in placeableObjects)
+        {
+            if (entry.placementButton != null)
+            {
+                entry.placementButton.interactable = interactable;
+            }
+        }
+    }
+}
