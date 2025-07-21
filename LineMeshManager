@@ -1,0 +1,406 @@
+using System.Collections.Generic;
+using UnityEngine;
+using System.Linq; // For .OrderBy and .FirstOrDefault
+
+[RequireComponent(typeof(MeshFilter), typeof(MeshRenderer), typeof(LineRenderer))]
+public class LineMeshManager : MonoBehaviour
+{
+    [Header("Manager Settings")]
+    [Tooltip("Check this box ONLY for the LineMeshManager GameObject you place directly in the scene. This instance will manage spawning new meshes.")]
+    public bool isSpawner = false; // Only one instance should have this true
+
+    [Header("Mesh Creation Settings (Copied to new meshes)")]
+    [Tooltip("Prefab to instantiate at each placed point (optional, for visual feedback).")]
+    public GameObject pointPrefab;
+    [Tooltip("Material for the generated mesh. IMPORTANT: Assign a visible material here.")]
+    public Material meshMaterial;
+    [Tooltip("Material for the LineRenderer drawing the outline.")]
+    public Material lineMaterial;
+    [Tooltip("Width of the line drawn by the LineRenderer.")]
+    public float lineWidth = 0.1f;
+
+    [Header("Curve Settings")]
+    [Tooltip("Number of segments per curve section. Higher values make the curve smoother.")]
+    [Range(2, 20)]
+    public int curveSegments = 10;
+
+    [Header("Normal Settings")]
+    [Tooltip("If true, the mesh normals will be inverted (making the inside surface visible from the outside).")]
+    public bool invertMesh = false;
+
+    [Header("Ground Conformance")]
+    [Tooltip("The LayerMask for the ground object(s) the mesh/line should conform to.")]
+    public LayerMask groundLayer;
+    [Tooltip("Offset above the ground where the line/mesh vertices will be placed.")]
+    public float groundOffset = 0.05f;
+
+    // Internal state for each LineMeshManager instance
+    private List<Vector3> controlPoints = new List<Vector3>();
+    private List<GameObject> pointVisuals = new List<GameObject>();
+    private LineRenderer lineRenderer;
+    private MeshFilter meshFilter;
+    private MeshRenderer meshRenderer;
+
+    private bool meshFinalizedForThisInstance = false; // True if this instance's mesh is generated
+    private bool initializedComponents = false; // To ensure Awake setup runs only once per instance
+
+    // Static reference to the currently active drawing instance
+    private static LineMeshManager currentDrawingInstance;
+
+    void Awake()
+    {
+        // This ensures Awake logic runs correctly even for instantiated objects
+        InitializeComponents();
+    }
+
+    // New method to encapsulate component initialization
+    private void InitializeComponents()
+    {
+        if (initializedComponents) return;
+
+        meshFilter = GetComponent<MeshFilter>();
+        meshRenderer = GetComponent<MeshRenderer>();
+        lineRenderer = GetComponent<LineRenderer>();
+
+        lineRenderer.startWidth = lineWidth;
+        lineRenderer.endWidth = lineWidth;
+        lineRenderer.useWorldSpace = true;
+        if (lineMaterial != null)
+        {
+            lineRenderer.material = lineMaterial;
+        }
+        else
+        {
+            Debug.LogWarning("Line material not assigned for " + gameObject.name + ". Using default white material for LineRenderer.");
+            lineRenderer.material = new Material(Shader.Find("Sprites/Default"));
+        }
+
+        meshRenderer.enabled = false;
+        lineRenderer.enabled = true; // Ensure line is visible when starting a new drawing
+        initializedComponents = true;
+    }
+
+
+    void Update()
+    {
+        // --- Spawner Logic (only for the instance marked as isSpawner) ---
+        if (isSpawner)
+        {
+            if (Input.GetMouseButtonDown(0))
+            {
+                Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
+                RaycastHit hit;
+
+                if (Physics.Raycast(ray, out hit, Mathf.Infinity, groundLayer))
+                {
+                    Vector3 newPoint = hit.point + Vector3.up * groundOffset;
+
+                    // If no current drawing, or the current one is finalized, spawn a new one
+                    if (currentDrawingInstance == null || currentDrawingInstance.meshFinalizedForThisInstance)
+                    {
+                        SpawnNewMeshGenerator(newPoint);
+                    }
+                    else
+                    {
+                        // If there IS a current drawing, pass the click to it.
+                        // This handles clicks for the ongoing drawing.
+                        currentDrawingInstance.AddPoint(newPoint);
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning("Mouse click did not hit any object on the specified Ground Layer!");
+                }
+            }
+
+            // Only the spawner handles the global reset (R key)
+            if (Input.GetKeyDown(KeyCode.R))
+            {
+                // This will reset the currently active drawing, if any.
+                if (currentDrawingInstance != null && !currentDrawingInstance.meshFinalizedForThisInstance)
+                {
+                    currentDrawingInstance.ResetDrawingState();
+                } else if (currentDrawingInstance != null && currentDrawingInstance.meshFinalizedForThisInstance)
+                {
+                    // If the current is finalized, pressing R on the spawner clears its state
+                    // to allow a fresh start for a new drawing instance.
+                    currentDrawingInstance = null; // Clear reference to finished mesh
+                    Debug.Log("Spawner: Cleared reference to last finalized mesh. Ready to start new drawing.");
+                } else if (currentDrawingInstance == null)
+                {
+                    // No active drawing, spawner is ready.
+                    Debug.Log("Spawner: No active drawing to reset. Ready to start new drawing.");
+                }
+            }
+        }
+        // --- End Spawner Logic ---
+
+        // --- Drawing and Mesh Generation Logic (for all instances that are currentDrawingInstance) ---
+        if (currentDrawingInstance == this)
+        {
+            // Enter key finalizes the current mesh
+            if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter))
+            {
+                if (controlPoints.Count >= 3)
+                {
+                    GenerateMesh();
+                    meshFinalizedForThisInstance = true; // Mark this instance as finalized
+                    lineRenderer.enabled = false; // Hide the line for the finished mesh
+                    currentDrawingInstance = null; // IMPORTANT: Clear current drawing so spawner knows to create a new one
+                    Debug.Log(gameObject.name + " mesh finalized. Ready for next mesh.");
+                }
+                else
+                {
+                    Debug.LogWarning("Need at least 3 points to form a polygon to generate a mesh. Current control points: " + controlPoints.Count);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Called by the spawner to add a point to the current active drawing instance.
+    /// </summary>
+    public void AddPoint(Vector3 point)
+    {
+        if (meshFinalizedForThisInstance) return; // Cannot add points to a finalized mesh
+
+        controlPoints.Add(point);
+        if (pointPrefab != null)
+        {
+            GameObject visual = Instantiate(pointPrefab, point, Quaternion.identity, transform);
+            pointVisuals.Add(visual);
+        }
+        UpdateLineRenderer();
+    }
+
+    /// <summary>
+    /// Spawns a new LineMeshManager GameObject and sets it as the current drawing instance.
+    /// </summary>
+    private void SpawnNewMeshGenerator(Vector3 firstPoint)
+    {
+        // Create a new GameObject
+        GameObject newMeshGO = new GameObject("LineMesh_Instance_" + System.DateTime.Now.ToString("HHmmss"));
+        
+        // Add the LineMeshManager component to the new GameObject
+        LineMeshManager newManager = newMeshGO.AddComponent<LineMeshManager>();
+
+        // Ensure components are initialized for the new instance
+        newManager.InitializeComponents();
+
+        // Copy settings from this (spawner) manager to the new one
+        newManager.pointPrefab = pointPrefab;
+        newManager.meshMaterial = meshMaterial;
+        newManager.lineMaterial = lineMaterial;
+        newManager.lineWidth = lineWidth;
+        newManager.curveSegments = curveSegments;
+        newManager.invertMesh = invertMesh;
+        newManager.groundLayer = groundLayer;
+        newManager.groundOffset = groundOffset;
+
+        // Set the new instance as the current active drawing instance
+        currentDrawingInstance = newManager;
+
+        // Add the very first point to the new manager (this triggers its drawing)
+        newManager.AddPoint(firstPoint);
+
+        Debug.Log("New LineMeshManager instance spawned: " + newMeshGO.name);
+    }
+
+    /// <summary>
+    /// Resets the current drawing state for this specific LineMeshManager instance.
+    /// </summary>
+    public void ResetDrawingState()
+    {
+        controlPoints.Clear();
+        foreach (GameObject visual in pointVisuals)
+        {
+            Destroy(visual);
+        }
+        pointVisuals.Clear();
+
+        lineRenderer.positionCount = 0;
+        lineRenderer.enabled = true; // Re-enable for new drawing if it was disabled
+        if (meshFilter.mesh != null)
+        {
+            Destroy(meshFilter.mesh); // Destroy the old mesh asset
+            meshFilter.mesh = null;
+        }
+        meshRenderer.enabled = false;
+        meshFinalizedForThisInstance = false;
+        // Do NOT set currentDrawingInstance to null here directly, that's spawner's job if it decides to.
+        Debug.Log(gameObject.name + " drawing reset.");
+    }
+
+
+    void UpdateLineRenderer()
+    {
+        if (controlPoints.Count < 2)
+        {
+            lineRenderer.positionCount = controlPoints.Count;
+            if (controlPoints.Count == 1)
+            {
+                lineRenderer.SetPosition(0, controlPoints[0]);
+            }
+            return;
+        }
+
+        List<Vector3> splinePoints = GenerateSplinePoints(true);
+
+        lineRenderer.positionCount = splinePoints.Count;
+        lineRenderer.SetPositions(splinePoints.ToArray());
+    }
+
+    private List<Vector3> GenerateSplinePoints(bool closedLoop)
+    {
+        List<Vector3> splinePoints = new List<Vector3>();
+        if (controlPoints.Count < 2) return splinePoints;
+
+        List<Vector3> tempPoints = new List<Vector3>(controlPoints);
+
+        if (closedLoop && controlPoints.Count >= 3)
+        {
+            tempPoints.Insert(0, controlPoints[controlPoints.Count - 1]);
+            tempPoints.Add(controlPoints[0]);
+            tempPoints.Add(controlPoints[1]);
+        }
+        else
+        {
+            if (controlPoints.Count == 2)
+            {
+                tempPoints.Insert(0, controlPoints[0]);
+                tempPoints.Add(controlPoints[1]);
+            }
+            else
+            {
+                tempPoints.Insert(0, tempPoints[controlPoints.Count - 1]);
+            }
+        }
+
+        for (int i = 0; i < tempPoints.Count - 3; i++)
+        {
+            for (int j = 0; j <= curveSegments; j++)
+            {
+                float t = (float)j / curveSegments;
+                if (j == 0 && i > 0) continue;
+
+                Vector3 interpolatedPoint = CalculateCatmullRom(tempPoints[i], tempPoints[i + 1], tempPoints[i + 2], tempPoints[i + 3], t);
+
+                RaycastHit hit;
+                Vector3 rayOrigin = new Vector3(interpolatedPoint.x, Camera.main.transform.position.y + 100f, interpolatedPoint.z);
+                float raycastDistance = Camera.main.transform.position.y + 200f;
+
+                if (Physics.Raycast(rayOrigin, Vector3.down, out hit, raycastDistance, groundLayer))
+                {
+                    interpolatedPoint.y = hit.point.y + groundOffset;
+                }
+                else
+                {
+                    Debug.LogWarning($"Spline point at X:{interpolatedPoint.x}, Z:{interpolatedPoint.z} did not hit ground. Point will use its calculated Y.");
+                }
+                splinePoints.Add(interpolatedPoint);
+            }
+        }
+        return splinePoints;
+    }
+
+    private Vector3 CalculateCatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+    {
+        float t2 = t * t;
+        float t3 = t2 * t;
+
+        float a = 0.5f * (2f * p1.x + (-p0.x + p2.x) * t + (2f * p0.x - 5f * p1.x + 4f * p2.x - p3.x) * t2 + (-p0.x + 3f * p1.x - 3f * p2.x + p3.x) * t3);
+        float b = 0.5f * (2f * p1.y + (-p0.y + p2.y) * t + (2f * p0.y - 5f * p1.y + 4f * p2.y - p3.y) * t2 + (-p0.y + 3f * p1.y - 3f * p2.y + p3.y) * t3);
+        float c = 0.5f * (2f * p1.z + (-p0.z + p2.z) * t + (2f * p0.z - 5f * p1.z + 4f * p2.z - p3.z) * t2 + (-p0.z + 3f * p1.z - 3f * p2.z + p3.z) * t3);
+
+        return new Vector3(a, b, c);
+    }
+
+    void GenerateMesh()
+    {
+        if (controlPoints.Count < 3)
+        {
+            Debug.LogWarning("Need at least 3 points to form a polygon. Current control points: " + controlPoints.Count);
+            return;
+        }
+
+        Mesh mesh = new Mesh();
+        List<Vector3> vertices = new List<Vector3>();
+        List<int> triangles = new List<int>();
+        List<Vector2> uvs = new List<Vector2>();
+
+        List<Vector3> splineMeshPoints = GenerateSplinePoints(true);
+
+        if (splineMeshPoints.Count < 3)
+        {
+            Debug.LogWarning("Not enough spline points generated to form a mesh.");
+            return;
+        }
+
+        Vector3[] localSplineVertices = new Vector3[splineMeshPoints.Count];
+        for (int i = 0; i < splineMeshPoints.Count; i++)
+        {
+            localSplineVertices[i] = transform.InverseTransformPoint(splineMeshPoints[i]);
+        }
+
+        Vector3 minBounds = localSplineVertices[0];
+        Vector3 maxBounds = localSplineVertices[0];
+        foreach (Vector3 p in localSplineVertices)
+        {
+            minBounds = Vector3.Min(minBounds, p);
+            maxBounds = Vector3.Max(maxBounds, p);
+        }
+        float rangeX = maxBounds.x - minBounds.x;
+        float rangeZ = maxBounds.z - minBounds.z;
+        if (rangeX == 0) rangeX = 1f;
+        if (rangeZ == 0) rangeZ = 1f;
+
+        for (int i = 0; i < localSplineVertices.Length; i++)
+        {
+            vertices.Add(localSplineVertices[i]);
+            uvs.Add(new Vector2((localSplineVertices[i].x - minBounds.x) / rangeX, (localSplineVertices[i].z - minBounds.z) / rangeZ));
+        }
+
+        for (int i = 1; i < localSplineVertices.Length - 1; i++)
+        {
+            AddTriangle(triangles, 0, i, i + 1, invertMesh);
+        }
+
+        mesh.vertices = vertices.ToArray();
+        mesh.triangles = triangles.ToArray();
+        mesh.uv = uvs.ToArray();
+
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+
+        meshFilter.mesh = mesh;
+
+        if (meshMaterial != null)
+        {
+            meshRenderer.material = meshMaterial;
+        }
+        else
+        {
+            Debug.LogWarning("Mesh material not assigned for " + gameObject.name + ". Using default Standard material.");
+            meshRenderer.material = new Material(Shader.Find("Standard"));
+        }
+
+        meshRenderer.enabled = true;
+        Debug.Log(gameObject.name + " mesh generated with " + mesh.vertexCount + " vertices and " + mesh.triangles.Length / 3 + " triangles.");
+    }
+
+    private void AddTriangle(List<int> list, int v1, int v2, int v3, bool invert)
+    {
+        if (!invert)
+        {
+            list.Add(v1);
+            list.Add(v2);
+            list.Add(v3);
+        }
+        else
+        {
+            list.Add(v1);
+            list.Add(v3);
+            list.Add(v2);
+        }
+    }
+}
