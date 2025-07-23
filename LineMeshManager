@@ -11,10 +11,10 @@ public class LineMeshManager : MonoBehaviour
     [Tooltip("Check this box ONLY for the LineMeshManager GameObject you place directly in the scene. This instance will manage spawning new meshes.")]
     public bool isSpawner = false; // Only one instance should have this true
 
-    // NEW: Button slot for activating point placement
+    // MODIFIED: Array of Buttons for activating point placement
     [Header("Activation Settings")]
-    [Tooltip("Drag the UI Button here that should activate point placement.")]
-    public Button activateDrawingButton; // Public slot for a UI Button reference
+    [Tooltip("Drag the UI Buttons here that should activate point placement.")]
+    public Button[] activateDrawingButtons; // Public slot for an array of UI Button references
 
     [Header("Mesh Creation Settings (Copied to new meshes)")]
     [Tooltip("Prefab to instantiate at each placed point (optional, for visual feedback).")]
@@ -41,6 +41,17 @@ public class LineMeshManager : MonoBehaviour
     [Tooltip("Offset above the ground where the line/mesh vertices will be placed.")]
     public float groundOffset = 0.05f;
 
+    // NEW: Mesh Generation Settings for quad-like appearance
+    [Header("Mesh Generation Details")]
+    [Tooltip("Determines how far the first inner loop of vertices is from the outer spline. 0 = collapses to centroid, 1 = same as outer loop.")]
+    [Range(0.0f, 0.9f)]
+    public float innerLoopScale = 0.5f;
+
+    [Tooltip("Determines how far the second (innermost) loop of vertices is from the outer spline. Must be less than Inner Loop Scale.")]
+    [Range(0.0f, 0.89f)] // Max value set to be slightly less than innerLoopScale's max
+    public float innermostLoopScale = 0.25f;
+
+
     // Internal state for each LineMeshManager instance
     private List<Vector3> controlPoints = new List<Vector3>();
     private List<GameObject> pointVisuals = new List<GameObject>();
@@ -65,20 +76,43 @@ public class LineMeshManager : MonoBehaviour
     void OnEnable()
     {
         // Subscribe to the button's click event when the script is enabled
-        if (isSpawner && activateDrawingButton != null)
+        if (isSpawner && activateDrawingButtons != null)
         {
-            activateDrawingButton.onClick.AddListener(StartNewDrawingSessionFromButton);
-            Debug.Log("Subscribed to Activate Drawing Button click event.");
+            foreach (Button button in activateDrawingButtons)
+            {
+                if (button != null)
+                {
+                    button.onClick.AddListener(StartNewDrawingSessionFromButton);
+                    Debug.Log($"Subscribed to '{button.name}' click event.");
+                }
+            }
         }
     }
 
     void OnDisable()
     {
         // Unsubscribe from the button's click event when the script is disabled
-        if (isSpawner && activateDrawingButton != null)
+        if (isSpawner && activateDrawingButtons != null)
         {
-            activateDrawingButton.onClick.RemoveListener(StartNewDrawingSessionFromButton);
-            Debug.Log("Unsubscribed from Activate Drawing Button click event.");
+            foreach (Button button in activateDrawingButtons)
+            {
+                if (button != null)
+                {
+                    button.onClick.RemoveListener(StartNewDrawingSessionFromButton);
+                    Debug.Log($"Unsubscribed from '{button.name}' click event.");
+                }
+            }
+        }
+    }
+
+    // Ensures innermostLoopScale is always less than innerLoopScale in the editor
+    void OnValidate()
+    {
+        if (innermostLoopScale >= innerLoopScale)
+        {
+            innermostLoopScale = innerLoopScale - 0.01f; // Force it to be smaller
+            if (innermostLoopScale < 0) innermostLoopScale = 0; // Prevent negative
+            Debug.LogWarning("Innermost Loop Scale must be less than Inner Loop Scale. Adjusted automatically.");
         }
     }
 
@@ -158,13 +192,15 @@ public class LineMeshManager : MonoBehaviour
                 {
                     currentDrawingInstance.ResetDrawingState();
                     isDrawingSessionActive = false; // Deactivate session on reset
-                } else if (currentDrawingInstance != null && currentDrawingInstance.meshFinalizedForThisInstance)
+                }
+                else if (currentDrawingInstance != null && currentDrawingInstance.meshFinalizedForThisInstance)
                 {
                     // If the current is finalized, pressing R on the spawner clears its state
                     currentDrawingInstance = null; // Clear reference to finished mesh
                     isDrawingSessionActive = false; // Deactivate session
                     Debug.Log("Spawner: Cleared reference to last finalized mesh. Ready to start new drawing.");
-                } else if (currentDrawingInstance == null)
+                }
+                else if (currentDrawingInstance == null)
                 {
                     // No active drawing, spawner is ready.
                     isDrawingSessionActive = false; // Ensure session is inactive
@@ -268,6 +304,8 @@ public class LineMeshManager : MonoBehaviour
         newManager.invertMesh = invertMesh;
         newManager.groundLayer = groundLayer;
         newManager.groundOffset = groundOffset;
+        newManager.innerLoopScale = innerLoopScale; // Copy new setting
+        newManager.innermostLoopScale = innermostLoopScale; // Copy new setting
 
         // Set the new instance as the current active drawing instance
         currentDrawingInstance = newManager;
@@ -361,12 +399,15 @@ public class LineMeshManager : MonoBehaviour
         {
             if (controlPoints.Count == 2)
             {
+                // For a line, duplicate start and end points to make Catmull-Rom work
                 tempPoints.Insert(0, controlPoints[0]);
                 tempPoints.Add(controlPoints[1]);
             }
-            else
+            else if (controlPoints.Count > 0) // For single point or more than 2 but not enough for closed loop
             {
-                tempPoints.Insert(0, tempPoints[controlPoints.Count - 1]);
+                // Duplicate first and last points for open spline
+                tempPoints.Insert(0, tempPoints[0]);
+                tempPoints.Add(tempPoints[tempPoints.Count - 1]);
             }
         }
 
@@ -375,13 +416,15 @@ public class LineMeshManager : MonoBehaviour
             for (int j = 0; j <= curveSegments; j++)
             {
                 float t = (float)j / curveSegments;
+                // Avoid duplicating points at the start of each segment if not the very first point
                 if (j == 0 && i > 0) continue;
 
                 Vector3 interpolatedPoint = CalculateCatmullRom(tempPoints[i], tempPoints[i + 1], tempPoints[i + 2], tempPoints[i + 3], t);
 
                 RaycastHit hit;
-                Vector3 rayOrigin = new Vector3(interpolatedPoint.x, Camera.main.transform.position.y + 100f, interpolatedPoint.z);
-                float raycastDistance = Camera.main.transform.position.y + 200f;
+                // Raycast from above to conform to ground
+                Vector3 rayOrigin = new Vector3(interpolatedPoint.x, Camera.main.transform.position.y + 100f, interpolatedPoint.z); // Start high above
+                float raycastDistance = Camera.main.transform.position.y + 200f; // Ensure ray covers ground below
 
                 if (Physics.Raycast(rayOrigin, Vector3.down, out hit, raycastDistance, groundLayer))
                 {
@@ -422,7 +465,7 @@ public class LineMeshManager : MonoBehaviour
         List<int> triangles = new List<int>();
         List<Vector2> uvs = new List<Vector2>();
 
-        List<Vector3> splineMeshPoints = GenerateSplinePoints(true);
+        List<Vector3> splineMeshPoints = GenerateSplinePoints(true); // Outer loop
 
         if (splineMeshPoints.Count < 3)
         {
@@ -430,34 +473,177 @@ public class LineMeshManager : MonoBehaviour
             return;
         }
 
+        // Calculate centroid of the outer spline points
+        Vector3 centroid = Vector3.zero;
+        foreach (Vector3 p in splineMeshPoints)
+        {
+            centroid += p;
+        }
+        centroid /= splineMeshPoints.Count;
+
+        // Project centroid to ground
+        RaycastHit centroidHit;
+        Vector3 rayOriginCentroid = new Vector3(centroid.x, Camera.main.transform.position.y + 100f, centroid.z);
+        if (Physics.Raycast(rayOriginCentroid, Vector3.down, out centroidHit, Camera.main.transform.position.y + 200f, groundLayer))
+        {
+            centroid.y = centroidHit.point.y + groundOffset;
+        }
+        else
+        {
+            Debug.LogWarning("Centroid did not hit ground. Using calculated Y.");
+        }
+
+
+        // Generate first inner loop points
+        List<Vector3> innerSplinePoints = new List<Vector3>();
+        foreach (Vector3 p in splineMeshPoints)
+        {
+            Vector3 innerPoint = Vector3.Lerp(centroid, p, innerLoopScale);
+            // Project inner point to ground
+            RaycastHit innerHit;
+            Vector3 rayOriginInner = new Vector3(innerPoint.x, Camera.main.transform.position.y + 100f, innerPoint.z);
+            if (Physics.Raycast(rayOriginInner, Vector3.down, out innerHit, Camera.main.transform.position.y + 200f, groundLayer))
+            {
+                innerPoint.y = innerHit.point.y + groundOffset;
+            }
+            else
+            {
+                Debug.LogWarning($"Inner spline point at X:{innerPoint.x}, Z:{innerPoint.z} did not hit ground. Point will use its calculated Y.");
+            }
+            innerSplinePoints.Add(innerPoint);
+        }
+
+        // Generate second (innermost) loop points
+        List<Vector3> innermostSplinePoints = new List<Vector3>();
+        foreach (Vector3 p in splineMeshPoints) // Base off outer points and innermostLoopScale
+        {
+            Vector3 innermostPoint = Vector3.Lerp(centroid, p, innermostLoopScale);
+            // Project innermost point to ground
+            RaycastHit innermostHit;
+            Vector3 rayOriginInnermost = new Vector3(innermostPoint.x, Camera.main.transform.position.y + 100f, innermostPoint.z);
+            if (Physics.Raycast(rayOriginInnermost, Vector3.down, out innermostHit, Camera.main.transform.position.y + 200f, groundLayer))
+            {
+                innermostPoint.y = innermostHit.point.y + groundOffset;
+            }
+            else
+            {
+                Debug.LogWarning($"Innermost spline point at X:{innermostPoint.x}, Z:{innermostPoint.z} did not hit ground. Point will use its calculated Y.");
+            }
+            innermostSplinePoints.Add(innermostPoint);
+        }
+
+
+        // Convert to local space for mesh
         Vector3[] localSplineVertices = new Vector3[splineMeshPoints.Count];
+        Vector3[] localInnerSplineVertices = new Vector3[innerSplinePoints.Count];
+        Vector3[] localInnermostSplineVertices = new Vector3[innermostSplinePoints.Count];
+
+
         for (int i = 0; i < splineMeshPoints.Count; i++)
         {
             localSplineVertices[i] = transform.InverseTransformPoint(splineMeshPoints[i]);
+            localInnerSplineVertices[i] = transform.InverseTransformPoint(innerSplinePoints[i]);
+            localInnermostSplineVertices[i] = transform.InverseTransformPoint(innermostSplinePoints[i]);
         }
 
+        // Add all loop vertices
+        vertices.AddRange(localSplineVertices);          // Indices 0 to N-1
+        vertices.AddRange(localInnerSplineVertices);     // Indices N to 2N-1
+        vertices.AddRange(localInnermostSplineVertices); // Indices 2N to 3N-1
+
+        // UV calculation (still based on XZ bounds)
         Vector3 minBounds = localSplineVertices[0];
-        Vector3 maxBounds = localSplineVertices[0]; // Corrected typo here
-        foreach (Vector3 p in localSplineVertices)
-        {
-            minBounds = Vector3.Min(minBounds, p);
-            maxBounds = Vector3.Max(maxBounds, p);
-        }
+        Vector3 maxBounds = localSplineVertices[0];
+        foreach (Vector3 p in localSplineVertices) { minBounds = Vector3.Min(minBounds, p); maxBounds = Vector3.Max(maxBounds, p); }
+        foreach (Vector3 p in localInnerSplineVertices) { minBounds = Vector3.Min(minBounds, p); maxBounds = Vector3.Max(maxBounds, p); }
+        foreach (Vector3 p in localInnermostSplineVertices) { minBounds = Vector3.Min(minBounds, p); maxBounds = Vector3.Max(maxBounds, p); }
+
+
         float rangeX = maxBounds.x - minBounds.x;
         float rangeZ = maxBounds.z - minBounds.z;
         if (rangeX == 0) rangeX = 1f;
         if (rangeZ == 0) rangeZ = 1f;
 
+        // Add UVs for all loops
         for (int i = 0; i < localSplineVertices.Length; i++)
         {
-            vertices.Add(localSplineVertices[i]);
-            uvs.Add(new Vector2((localSplineVertices[i].x - minBounds.x) / rangeX, (localSplineVertices[i].z - minBounds.z) / rangeZ));
+            uvs.Add(new Vector2((localSplineVertices[i].x - minBounds.x) / rangeX, (localSplineVertices[i].z - minBounds.x) / rangeZ));
+        }
+        for (int i = 0; i < localInnerSplineVertices.Length; i++)
+        {
+            uvs.Add(new Vector2((localInnerSplineVertices[i].x - minBounds.x) / rangeX, (localInnerSplineVertices[i].z - minBounds.x) / rangeZ));
+        }
+        for (int i = 0; i < localInnermostSplineVertices.Length; i++)
+        {
+            uvs.Add(new Vector2((localInnermostSplineVertices[i].x - minBounds.x) / rangeX, (localInnermostSplineVertices[i].z - minBounds.x) / rangeZ));
         }
 
-        for (int i = 1; i < localSplineVertices.Length - 1; i++)
+
+        int numPointsPerLoop = splineMeshPoints.Count;
+
+        // Triangulate between Outer and First Inner loops (Strip 1)
+        int outerLoopStartIdx = 0;
+        int innerLoopStartIdx = numPointsPerLoop;
+
+        for (int i = 0; i < numPointsPerLoop; i++)
         {
-            AddTriangle(triangles, 0, i, i + 1, invertMesh);
+            int currentOuter = outerLoopStartIdx + i;
+            int nextOuter = outerLoopStartIdx + (i + 1) % numPointsPerLoop;
+
+            int currentInner = innerLoopStartIdx + i;
+            int nextInner = innerLoopStartIdx + (i + 1) % numPointsPerLoop;
+
+            // Quad 1 (two triangles): currentOuter, nextOuter, nextInner, currentInner
+            AddTriangle(triangles, currentOuter, nextOuter, currentInner, invertMesh);
+            AddTriangle(triangles, nextOuter, nextInner, currentInner, invertMesh);
         }
+
+        // Triangulate between First Inner and Second (Innermost) loops (Strip 2)
+        int innermostLoopStartIdx = 2 * numPointsPerLoop;
+
+        for (int i = 0; i < numPointsPerLoop; i++)
+        {
+            int currentInner = innerLoopStartIdx + i;
+            int nextInner = innerLoopStartIdx + (i + 1) % numPointsPerLoop;
+
+            int currentInnermost = innermostLoopStartIdx + i;
+            int nextInnermost = innermostLoopStartIdx + (i + 1) % numPointsPerLoop;
+
+            // Quad 2 (two triangles): currentInner, nextInner, nextInnermost, currentInnermost
+            AddTriangle(triangles, currentInner, nextInner, currentInnermost, invertMesh);
+            AddTriangle(triangles, nextInner, nextInnermost, currentInnermost, invertMesh);
+        }
+
+
+        // Triangulate the innermost hole
+        // If innermostLoopScale is very small (approaching 0), the innermost loop collapses to the centroid.
+        // In that case, we triangulate the innermost part as a fan from the centroid.
+        // Otherwise, triangulate the innermost polygon.
+        if (innermostLoopScale <= 0.001f) // Innermost loop collapses to centroid
+        {
+            // Add centroid as the last vertex
+            vertices.Add(transform.InverseTransformPoint(centroid));
+            uvs.Add(new Vector2((centroid.x - minBounds.x) / rangeX, (centroid.z - minBounds.z) / rangeZ)); // UV for centroid
+            int centroidIdx = vertices.Count - 1;
+
+            // Triangulate from innermost loop to centroid
+            for (int i = 0; i < numPointsPerLoop; i++)
+            {
+                int currentInnermost = innermostLoopStartIdx + i;
+                int nextInnermost = innermostLoopStartIdx + (i + 1) % numPointsPerLoop;
+                AddTriangle(triangles, currentInnermost, nextInnermost, centroidIdx, invertMesh);
+            }
+        }
+        else // Innermost loop forms a polygon, triangulate it
+        {
+            // Simple fan triangulation from the first innermost point
+            int firstInnermostPointIdx = innermostLoopStartIdx;
+            for (int i = 1; i < numPointsPerLoop - 1; i++)
+            {
+                AddTriangle(triangles, firstInnermostPointIdx, innermostLoopStartIdx + i, innermostLoopStartIdx + i + 1, invertMesh);
+            }
+        }
+
 
         mesh.vertices = vertices.ToArray();
         mesh.triangles = triangles.ToArray();
