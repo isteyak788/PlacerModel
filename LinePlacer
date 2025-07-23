@@ -1,10 +1,23 @@
-// Assets/Scripts/LinePlacer.cs
+// Assets/Scripts/CORE/LinePlacer.cs
 using UnityEngine;
 using System.Collections.Generic;
 using System.Linq; // Required for .Last() extension method
-using UnityEngine.UI; // Required for Button
+using UnityEngine.UI; // Required for Button and Toggle
 using TMPro; // Required if you're using TextMeshPro for button text
 using UnityEngine.EventSystems; // Required for IsPointerOverUIObject
+
+// Re-adding the BuildingInfo class definition as it was mentioned as 'REMOVED'
+// and its absence is the likely cause of 'occupyGrid' context error,
+// as PlaceableObjectEntry depends on it.
+//[System.Serializable]
+//public class BuildingInfo
+//{
+//    public string buildingName;
+//    public GameObject buildingPrefab;
+//    public GameObject buildingGhostPrefab;
+//    public Vector3 buildingBoundsExtents = new Vector3(0.5f, 0.5f, 0.5f); // Default to half a unit cube
+//}
+
 
 public class LinePlacer : MonoBehaviour
 {
@@ -20,43 +33,48 @@ public class LinePlacer : MonoBehaviour
     private LinePlacementState currentState = LinePlacementState.Idle;
 
     // New Enum to distinguish which placement mode is active (set by buttons)
-    public enum ActivePlacementMode // Made public to resolve accessibility accessibility
+    public enum ActivePlacementMode
     {
         None,
-        Line,
-        Box,         // Original combined Box Line and Box Fill
-        LineLoop,    // From previous modification
-        BoxLine,     // Separate Box Line
-        BoxFill,     // Separate Box Fill
-        LineLoopFill, // For line loop with fill
-        LineCircle,   // For circle placement
-        LineCircleFill // NEW: For circle placement with fill
+        Line,         // Perimeter line (can be curved)
+        Box,          // Original combined Box Line and Box Fill
+        LineLoop,     // Closed line loop (can be curved)
+        BoxLine,      // Separate Box Line (perimeter only)
+        BoxFill,      // Separate Box Fill (fill only)
+        LineLoopFill, // Line loop with fill
+        LineCircle,   // Circle perimeter
+        LineCircleFill // Circle perimeter with fill
     }
     private ActivePlacementMode _currentActiveMode = ActivePlacementMode.None;
+
+    // This boolean will track if a 'fill' mode is active, without a direct UI Toggle.
+    private bool isLineFillActive;
 
     [System.Serializable]
     public class PlaceableObjectEntry
     {
-        [Tooltip("The BuildingInfo ScriptableObject for this entry.")]
-        public BuildingInfo buildingInfo; // Changed from GameObjects to BuildingInfo
+        [Tooltip("BuildingInfo for objects placed along lines (perimeter, curved lines, box lines, circle lines).")]
+        public BuildingInfo lineBuildingInfo;
+        [Tooltip("BuildingInfo for objects placed as fills (box fills, line loop fills, circle fills).")]
+        public BuildingInfo fillBuildingInfo;
 
         [Header("Activation Buttons")]
-        [Tooltip("Button to activate Line Placement with buildingInfo's buildingPrefab.")]
-        public Button lineButton; // RENAMED
+        [Tooltip("Button to activate Line Placement with lineBuildingInfo.")]
+        public Button lineButton;
         [Tooltip("Button to activate both Box Line and Box Fill placement simultaneously.")]
-        public Button boxAndFillButton; // RENAMED
-        [Tooltip("Button to activate Line Loop Placement with buildingInfo's buildingPrefab.")]
-        public Button lineLoopButton; // RENAMED
-        [Tooltip("Button to activate Box Line placement.")]
-        public Button boxLineButton; // RENAMED
-        [Tooltip("Button to activate Box Fill placement.")]
-        public Button boxFillButton; // RENAMED
-        [Tooltip("Button to activate Line Loop Fill placement.")]
-        public Button lineLoopFillButton; // RENAMED
-        [Tooltip("Button to activate Line Circle placement.")]
-        public Button lineCircleButton; // RENAMED
-        [Tooltip("NEW: Button to activate Line Circle Fill placement.")]
-        public Button lineCircleFillButton; // NEW
+        public Button boxAndFillButton;
+        [Tooltip("Button to activate Line Loop Placement with lineBuildingInfo.")]
+        public Button lineLoopButton;
+        [Tooltip("Button to activate Box Line placement (uses lineBuildingInfo).")]
+        public Button boxLineButton;
+        [Tooltip("Button to activate Box Fill placement (uses fillBuildingInfo).")]
+        public Button boxFillButton;
+        [Tooltip("Button to activate Line Loop Fill placement (uses both lineBuildingInfo and fillBuildingInfo).")]
+        public Button lineLoopFillButton;
+        [Tooltip("Button to activate Line Circle placement (uses lineBuildingInfo).")]
+        public Button lineCircleButton;
+        [Tooltip("Button to activate Line Circle Fill placement (uses both lineBuildingInfo and fillBuildingInfo).")]
+        public Button lineCircleFillButton;
 
 
         [Header("Placement Behavior")]
@@ -68,6 +86,10 @@ public class LinePlacer : MonoBehaviour
         public bool showGhost = true;
         [Tooltip("If true, allow continuous placement without re-clicking the button.")]
         public bool isContinuous = false;
+        [Tooltip("If true, line objects placed using this entry will be combined into a single mesh after placement.")]
+        public bool combineLineMeshes = false;
+        [Tooltip("If true, fill objects placed using this entry will be combined into a single mesh after placement.")]
+        public bool combineFillMeshes = false;
     }
 
     [Header("Placeable Objects & Controls")]
@@ -83,6 +105,9 @@ public class LinePlacer : MonoBehaviour
     public Material invalidPlacementMaterial;
     [Tooltip("The height from which to start the raycast downwards to find the terrain.")]
     public float terrainRaycastStartHeight = 100f;
+    [Tooltip("Optional prefab to instantiate as a parent for all placed objects. If null, a plain GameObject will be created.")]
+    public GameObject parentObjectPrefab;
+
 
     [Header("Line Placement Settings")]
     [Tooltip("The minimum length a line segment must have to place an object on it.")]
@@ -124,9 +149,11 @@ public class LinePlacer : MonoBehaviour
     private Vector3 _mouseWorldPosition;
     private bool _mouseWorldPositionFound;
 
-    // Prefabs for the currently active placement mode
-    private GameObject _currentActivePlacementPrefab; // The main prefab from BuildingInfo
-    private GameObject _currentActiveGhostPrefab;    // The ghost prefab from BuildingInfo
+    // Prefabs for the currently active placement mode (selected based on Line/Fill BuildingInfo)
+    private GameObject _currentActiveLinePlacementPrefab; // The main prefab from lineBuildingInfo
+    private GameObject _currentActiveLineGhostPrefab;    // The ghost prefab from lineBuildingInfo
+    private GameObject _currentActiveFillPlacementPrefab; // The main prefab from fillBuildingInfo
+    private GameObject _currentActiveFillGhostPrefab;    // The ghost prefab from fillBuildingInfo
 
     // Current entry whose button was clicked to activate a mode
     private PlaceableObjectEntry _currentSelectedEntry;
@@ -139,6 +166,9 @@ public class LinePlacer : MonoBehaviour
     private Vector3 _circleCenter;
     private float _circleRadius;
     private bool _isDrawingCircle = false;
+
+    // The current parent GameObject for newly placed objects
+    private GameObject _currentPlacementParent;
 
 
     // Grid occupation tracking
@@ -175,56 +205,56 @@ public class LinePlacer : MonoBehaviour
         foreach (var entry in placeableObjectEntries)
         {
             // Ensure BuildingInfo and its prefabs are valid before enabling buttons
-            bool hasValidBuildingPrefab = entry.buildingInfo != null && entry.buildingInfo.buildingPrefab != null;
-            bool hasValidGhostPrefab = entry.buildingInfo != null && entry.buildingInfo.buildingGhostPrefab != null;
+            bool hasValidLinePrefab = entry.lineBuildingInfo != null && (entry.lineBuildingInfo.buildingPrefab != null || entry.lineBuildingInfo.buildingGhostPrefab != null);
+            bool hasValidFillPrefab = entry.fillBuildingInfo != null && (entry.fillBuildingInfo.buildingPrefab != null || entry.fillBuildingInfo.buildingGhostPrefab != null);
 
-            if (entry.lineButton != null) // RENAMED
+            if (entry.lineButton != null)
             {
                 entry.lineButton.onClick.RemoveAllListeners();
                 entry.lineButton.onClick.AddListener(() => ActivateLineMode(entry));
-                entry.lineButton.interactable = hasValidBuildingPrefab || hasValidGhostPrefab;
+                entry.lineButton.interactable = hasValidLinePrefab;
             }
-            if (entry.boxAndFillButton != null) // RENAMED
+            if (entry.boxAndFillButton != null)
             {
                 entry.boxAndFillButton.onClick.RemoveAllListeners();
                 entry.boxAndFillButton.onClick.AddListener(() => ActivateBoxMode(entry));
-                entry.boxAndFillButton.interactable = hasValidBuildingPrefab || hasValidGhostPrefab;
+                entry.boxAndFillButton.interactable = hasValidLinePrefab && hasValidFillPrefab; // Needs both for combined
             }
-            if (entry.lineLoopButton != null) // RENAMED
+            if (entry.lineLoopButton != null)
             {
                 entry.lineLoopButton.onClick.RemoveAllListeners();
                 entry.lineLoopButton.onClick.AddListener(() => ActivateLineLoopMode(entry));
-                entry.lineLoopButton.interactable = hasValidBuildingPrefab || hasValidGhostPrefab;
+                entry.lineLoopButton.interactable = hasValidLinePrefab;
             }
-            if (entry.boxLineButton != null) // RENAMED
+            if (entry.boxLineButton != null)
             {
                 entry.boxLineButton.onClick.RemoveAllListeners();
                 entry.boxLineButton.onClick.AddListener(() => ActivateBoxLineMode(entry));
-                entry.boxLineButton.interactable = hasValidBuildingPrefab || hasValidGhostPrefab;
+                entry.boxLineButton.interactable = hasValidLinePrefab;
             }
-            if (entry.boxFillButton != null) // RENAMED
+            if (entry.boxFillButton != null)
             {
                 entry.boxFillButton.onClick.RemoveAllListeners();
                 entry.boxFillButton.onClick.AddListener(() => ActivateBoxFillMode(entry));
-                entry.boxFillButton.interactable = hasValidBuildingPrefab || hasValidGhostPrefab;
+                entry.boxFillButton.interactable = hasValidFillPrefab;
             }
-            if (entry.lineLoopFillButton != null) // RENAMED
+            if (entry.lineLoopFillButton != null)
             {
                 entry.lineLoopFillButton.onClick.RemoveAllListeners();
                 entry.lineLoopFillButton.onClick.AddListener(() => ActivateLineLoopFillMode(entry));
-                entry.lineLoopFillButton.interactable = hasValidBuildingPrefab || hasValidGhostPrefab;
+                entry.lineLoopFillButton.interactable = hasValidLinePrefab && hasValidFillPrefab; // Needs both
             }
-            if (entry.lineCircleButton != null) // RENAMED
+            if (entry.lineCircleButton != null)
             {
                 entry.lineCircleButton.onClick.RemoveAllListeners();
                 entry.lineCircleButton.onClick.AddListener(() => ActivateLineCircleMode(entry));
-                entry.lineCircleButton.interactable = hasValidBuildingPrefab || hasValidGhostPrefab;
+                entry.lineCircleButton.interactable = hasValidLinePrefab;
             }
-            if (entry.lineCircleFillButton != null) // NEW
+            if (entry.lineCircleFillButton != null)
             {
                 entry.lineCircleFillButton.onClick.RemoveAllListeners();
                 entry.lineCircleFillButton.onClick.AddListener(() => ActivateLineCircleFillMode(entry));
-                entry.lineCircleFillButton.interactable = hasValidBuildingPrefab || hasValidGhostPrefab;
+                entry.lineCircleFillButton.interactable = hasValidLinePrefab && hasValidFillPrefab; // Needs both
             }
         }
 
@@ -234,40 +264,38 @@ public class LinePlacer : MonoBehaviour
         if (defaultPlacementMode != ActivePlacementMode.None && defaultEntryIndex >= 0 && defaultEntryIndex < placeableObjectEntries.Length)
         {
             PlaceableObjectEntry defaultEntry = placeableObjectEntries[defaultEntryIndex];
-            if (defaultEntry.buildingInfo != null && defaultEntry.buildingInfo.buildingPrefab != null)
+            // Re-check validity based on the specific mode's requirements
+            bool canActivateDefault = false;
+            if (defaultPlacementMode == ActivePlacementMode.Line || defaultPlacementMode == ActivePlacementMode.LineLoop ||
+                defaultPlacementMode == ActivePlacementMode.BoxLine || defaultPlacementMode == ActivePlacementMode.LineCircle)
             {
-                if (defaultPlacementMode == ActivePlacementMode.Line)
-                {
-                    ActivateLineMode(defaultEntry);
-                }
-                else if (defaultPlacementMode == ActivePlacementMode.Box)
-                {
-                    ActivateBoxMode(defaultEntry);
-                }
-                else if (defaultPlacementMode == ActivePlacementMode.LineLoop)
-                {
-                    ActivateLineLoopMode(defaultEntry);
-                }
-                else if (defaultPlacementMode == ActivePlacementMode.BoxLine)
-                {
-                    ActivateBoxLineMode(defaultEntry);
-                }
-                else if (defaultPlacementMode == ActivePlacementMode.BoxFill)
-                {
-                    ActivateBoxFillMode(defaultEntry);
-                }
-                else if (defaultPlacementMode == ActivePlacementMode.LineLoopFill)
-                {
-                    ActivateLineLoopFillMode(defaultEntry);
-                }
-                else if (defaultPlacementMode == ActivePlacementMode.LineCircle)
-                {
-                    ActivateLineCircleMode(defaultEntry);
-                }
-                else if (defaultPlacementMode == ActivePlacementMode.LineCircleFill) // NEW
-                {
-                    ActivateLineCircleFillMode(defaultEntry);
-                }
+                canActivateDefault = defaultEntry.lineBuildingInfo != null && (defaultEntry.lineBuildingInfo.buildingPrefab != null || defaultEntry.lineBuildingInfo.buildingGhostPrefab != null);
+            }
+            else if (defaultPlacementMode == ActivePlacementMode.BoxFill)
+            {
+                canActivateDefault = defaultEntry.fillBuildingInfo != null && (defaultEntry.fillBuildingInfo.buildingPrefab != null || defaultEntry.fillBuildingInfo.buildingGhostPrefab != null);
+            }
+            else if (defaultPlacementMode == ActivePlacementMode.Box || defaultPlacementMode == ActivePlacementMode.LineLoopFill || defaultPlacementMode == ActivePlacementMode.LineCircleFill)
+            {
+                canActivateDefault = (defaultEntry.lineBuildingInfo != null && (defaultEntry.lineBuildingInfo.buildingPrefab != null || defaultEntry.lineBuildingInfo.buildingGhostPrefab != null)) &&
+                                     (defaultEntry.fillBuildingInfo != null && (defaultEntry.fillBuildingInfo.buildingPrefab != null || defaultEntry.fillBuildingInfo.buildingGhostPrefab != null));
+            }
+
+
+            if (canActivateDefault)
+            {
+                if (defaultPlacementMode == ActivePlacementMode.Line) ActivateLineMode(defaultEntry);
+                else if (defaultPlacementMode == ActivePlacementMode.Box) ActivateBoxMode(defaultEntry);
+                else if (defaultPlacementMode == ActivePlacementMode.LineLoop) ActivateLineLoopMode(defaultEntry);
+                else if (defaultPlacementMode == ActivePlacementMode.BoxLine) ActivateBoxLineMode(defaultEntry);
+                else if (defaultPlacementMode == ActivePlacementMode.BoxFill) ActivateBoxFillMode(defaultEntry);
+                else if (defaultPlacementMode == ActivePlacementMode.LineLoopFill) ActivateLineLoopFillMode(defaultEntry);
+                else if (defaultPlacementMode == ActivePlacementMode.LineCircle) ActivateLineCircleMode(defaultEntry);
+                else if (defaultPlacementMode == ActivePlacementMode.LineCircleFill) ActivateLineCircleFillMode(defaultEntry);
+            }
+            else
+            {
+                Debug.LogWarning($"Default placement mode {defaultPlacementMode} for entry {defaultEntryIndex} could not be activated due to missing BuildingInfo or prefabs.");
             }
         }
     }
@@ -276,58 +304,105 @@ public class LinePlacer : MonoBehaviour
     {
         foreach (var entry in placeableObjectEntries)
         {
-            if (entry.lineButton != null) entry.lineButton.onClick.RemoveAllListeners(); // RENAMED
-            if (entry.boxAndFillButton != null) entry.boxAndFillButton.onClick.RemoveAllListeners(); // RENAMED
-            if (entry.lineLoopButton != null) entry.lineLoopButton.onClick.RemoveAllListeners(); // RENAMED
-            if (entry.boxLineButton != null) entry.boxLineButton.onClick.RemoveAllListeners(); // RENAMED
-            if (entry.boxFillButton != null) entry.boxFillButton.onClick.RemoveAllListeners(); // RENAMED
-            if (entry.lineLoopFillButton != null) entry.lineLoopFillButton.onClick.RemoveAllListeners(); // RENAMED
-            if (entry.lineCircleButton != null) entry.lineCircleButton.onClick.RemoveAllListeners(); // RENAMED
-            if (entry.lineCircleFillButton != null) entry.lineCircleFillButton.onClick.RemoveAllListeners(); // NEW
+            if (entry.lineButton != null) entry.lineButton.onClick.RemoveAllListeners();
+            if (entry.boxAndFillButton != null) entry.boxAndFillButton.onClick.RemoveAllListeners();
+            if (entry.lineLoopButton != null) entry.lineLoopButton.onClick.RemoveAllListeners();
+            if (entry.boxLineButton != null) entry.boxLineButton.onClick.RemoveAllListeners();
+            if (entry.boxFillButton != null) entry.boxFillButton.onClick.RemoveAllListeners();
+            if (entry.lineLoopFillButton != null) entry.lineLoopFillButton.onClick.RemoveAllListeners();
+            if (entry.lineCircleButton != null) entry.lineCircleButton.onClick.RemoveAllListeners();
+            if (entry.lineCircleFillButton != null) entry.lineCircleFillButton.onClick.RemoveAllListeners();
         }
 
-        ExitPlacementMode();
+        // Only exit placement mode, do NOT destroy _currentPlacementParent here directly
+        // if it might contain permanent objects. Let individual placement complete functions handle it.
+        ExitPlacementMode(forceDestroyParent: false);
     }
 
     // Common setup for activating any placement mode
     private void StartPlacementSetup(PlaceableObjectEntry entry, ActivePlacementMode mode)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        // Basic validity check for the specific mode
+        bool isValid = false;
+        if (mode == ActivePlacementMode.Line || mode == ActivePlacementMode.LineLoop || mode == ActivePlacementMode.BoxLine || mode == ActivePlacementMode.LineCircle)
         {
-            Debug.LogError($"Cannot start placement for {entry.buildingInfo?.buildingName ?? "null entry"}: BuildingInfo or its prefabs are missing!");
+            isValid = entry.lineBuildingInfo != null && (entry.lineBuildingInfo.buildingPrefab != null || entry.lineBuildingInfo.buildingGhostPrefab != null);
+            _currentActiveLinePlacementPrefab = entry.lineBuildingInfo?.buildingPrefab;
+            _currentActiveLineGhostPrefab = entry.lineBuildingInfo?.buildingGhostPrefab;
+            _currentActiveFillPlacementPrefab = null; // Ensure fill prefabs are cleared if not used
+            _currentActiveFillGhostPrefab = null;
+        }
+        else if (mode == ActivePlacementMode.BoxFill)
+        {
+            isValid = entry.fillBuildingInfo != null && (entry.fillBuildingInfo.buildingPrefab != null || entry.fillBuildingInfo.buildingGhostPrefab != null);
+            _currentActiveFillPlacementPrefab = entry.fillBuildingInfo?.buildingPrefab;
+            _currentActiveFillGhostPrefab = entry.fillBuildingInfo?.buildingGhostPrefab;
+            _currentActiveLinePlacementPrefab = null; // Ensure line prefabs are cleared if not used
+            _currentActiveLineGhostPrefab = null;
+        }
+        else if (mode == ActivePlacementMode.Box || mode == ActivePlacementMode.LineLoopFill || mode == ActivePlacementMode.LineCircleFill)
+        {
+            isValid = (entry.lineBuildingInfo != null && (entry.lineBuildingInfo.buildingPrefab != null || entry.lineBuildingInfo.buildingGhostPrefab != null)) &&
+                      (entry.fillBuildingInfo != null && (entry.fillBuildingInfo.buildingPrefab != null || entry.fillBuildingInfo.buildingGhostPrefab != null));
+            _currentActiveLinePlacementPrefab = entry.lineBuildingInfo?.buildingPrefab;
+            _currentActiveLineGhostPrefab = entry.lineBuildingInfo?.buildingGhostPrefab;
+            _currentActiveFillPlacementPrefab = entry.fillBuildingInfo?.buildingPrefab;
+            _currentActiveFillGhostPrefab = entry.fillBuildingInfo?.buildingGhostPrefab;
+        }
+
+        if (!isValid)
+        {
+            Debug.LogError($"Cannot start placement for {entry.lineBuildingInfo?.buildingName ?? "null entry"}: Required BuildingInfo or its prefabs are missing for mode {mode}!");
             return;
         }
 
         // Handle continuous mode deactivation if the same button is pressed
         if (_currentActiveMode == mode && _currentSelectedEntry == entry && entry.isContinuous)
         {
-            Debug.Log($"Deactivating continuous {mode} placement for {entry.buildingInfo.buildingName}.");
+            Debug.Log($"Deactivating continuous {mode} placement for {entry.lineBuildingInfo?.buildingName ?? entry.fillBuildingInfo?.buildingName ?? "unknown"}.");
             ExitPlacementMode();
             return;
         }
 
         // Exit any currently active mode before starting a new one
+        // If _currentPlacementParent exists and has children, it means a previous
+        // placement completed successfully (non-continuous), so we should not destroy it.
+        // Instead, we just clear current mode state and create a new parent below.
         if (_currentActiveMode != ActivePlacementMode.None)
         {
-            ExitPlacementMode();
+            // If the previous mode was continuous and is now being switched off, clear previews.
+            // If it was non-continuous, it should have already been handled at placement completion.
+            DisableVisualAids();
+        }
+
+        // Always create a new parent when a *new* placement is initiated
+        // (unless it's continuous mode and the same button was re-pressed to deactivate it)
+        if (_currentPlacementParent == null || (_currentSelectedEntry != null && !_currentSelectedEntry.isContinuous))
+        {
+            _currentPlacementParent = InstantiatePlacementParent(Vector3.zero);
         }
 
         _currentSelectedEntry = entry;
         _currentActiveMode = mode;
 
-        // Assign prefabs from BuildingInfo
-        _currentActivePlacementPrefab = entry.buildingInfo.buildingPrefab;
-        _currentActiveGhostPrefab = entry.buildingInfo.buildingGhostPrefab;
-
         currentState = LinePlacementState.Idle;
         linePoints.Clear();
-        DisableVisualAids();
+        DisableVisualAids(); // Clear any existing previews from previous mode
         _isDrawingCircle = false;
         _circleRadius = 0;
 
+        // Set isLineFillActive based on the current mode
+        isLineFillActive = (mode == ActivePlacementMode.Box || mode == ActivePlacementMode.BoxFill || mode == ActivePlacementMode.LineLoopFill || mode == ActivePlacementMode.LineCircleFill);
+
+        if (isLineFillActive)
+        {
+            Debug.Log("Line Fill active");
+        }
+
+
         SetAllPlacementButtonsInteractable(false); // Disable all buttons once a mode is active
 
-        string debugMsg = $"Started {_currentActiveMode} placement for {entry.buildingInfo.buildingName}.";
+        string debugMsg = $"Started {_currentActiveMode} placement for {entry.lineBuildingInfo?.buildingName ?? entry.fillBuildingInfo?.buildingName ?? "unknown"}.";
         if (_currentActiveMode == ActivePlacementMode.Line || _currentActiveMode == ActivePlacementMode.LineLoop || _currentActiveMode == ActivePlacementMode.LineLoopFill)
         {
             debugMsg += " Click to add points. Press Enter to finalize. Right Click to cancel.";
@@ -344,13 +419,9 @@ public class LinePlacer : MonoBehaviour
         {
             debugMsg += " Click and Drag to define box, release to place. Right Click to cancel.";
         }
-        else if (_currentActiveMode == ActivePlacementMode.LineCircle)
+        else if (_currentActiveMode == ActivePlacementMode.LineCircle || _currentActiveMode == ActivePlacementMode.LineCircleFill)
         {
             debugMsg += " Click to set center, drag to set radius, click again to finalize. Right Click to cancel.";
-        }
-        else if (_currentActiveMode == ActivePlacementMode.LineCircleFill) // NEW
-        {
-            debugMsg += " Click to set center, drag to set radius, click again to finalize. Will fill the interior.";
         }
 
         if (entry.isContinuous) debugMsg += " (Continuous Mode: click button again to deactivate.)";
@@ -359,9 +430,9 @@ public class LinePlacer : MonoBehaviour
 
     public void ActivateLineMode(PlaceableObjectEntry entry)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        if (entry.lineBuildingInfo == null || (entry.lineBuildingInfo.buildingPrefab == null && entry.lineBuildingInfo.buildingGhostPrefab == null))
         {
-            Debug.LogWarning("Line object prefab is null for this entry's BuildingInfo.");
+            Debug.LogWarning("Line object prefab is null for this entry's Line BuildingInfo.");
             return;
         }
         StartPlacementSetup(entry, ActivePlacementMode.Line);
@@ -369,9 +440,10 @@ public class LinePlacer : MonoBehaviour
 
     public void ActivateBoxMode(PlaceableObjectEntry entry)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        if (entry.lineBuildingInfo == null || (entry.lineBuildingInfo.buildingPrefab == null && entry.lineBuildingInfo.buildingGhostPrefab == null) ||
+            entry.fillBuildingInfo == null || (entry.fillBuildingInfo.buildingPrefab == null && entry.fillBuildingInfo.buildingGhostPrefab == null))
         {
-            Debug.LogWarning("Box object prefab is null for this entry's BuildingInfo. Cannot activate Box mode.");
+            Debug.LogWarning("Box mode requires both Line and Fill prefabs to be assigned.");
             return;
         }
         StartPlacementSetup(entry, ActivePlacementMode.Box);
@@ -379,9 +451,9 @@ public class LinePlacer : MonoBehaviour
 
     public void ActivateLineLoopMode(PlaceableObjectEntry entry)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        if (entry.lineBuildingInfo == null || (entry.lineBuildingInfo.buildingPrefab == null && entry.lineBuildingInfo.buildingGhostPrefab == null))
         {
-            Debug.LogWarning("Line Loop object prefab is null for this entry's BuildingInfo.");
+            Debug.LogWarning("Line Loop object prefab is null for this entry's Line BuildingInfo.");
             return;
         }
         StartPlacementSetup(entry, ActivePlacementMode.LineLoop);
@@ -389,9 +461,9 @@ public class LinePlacer : MonoBehaviour
 
     public void ActivateBoxLineMode(PlaceableObjectEntry entry)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        if (entry.lineBuildingInfo == null || (entry.lineBuildingInfo.buildingPrefab == null && entry.lineBuildingInfo.buildingGhostPrefab == null))
         {
-            Debug.LogWarning("Box Line object prefab is null for this entry's BuildingInfo.");
+            Debug.LogWarning("Box Line object prefab is null for this entry's Line BuildingInfo.");
             return;
         }
         StartPlacementSetup(entry, ActivePlacementMode.BoxLine);
@@ -399,9 +471,9 @@ public class LinePlacer : MonoBehaviour
 
     public void ActivateBoxFillMode(PlaceableObjectEntry entry)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        if (entry.fillBuildingInfo == null || (entry.fillBuildingInfo.buildingPrefab == null && entry.fillBuildingInfo.buildingGhostPrefab == null))
         {
-            Debug.LogWarning("Box Fill object prefab is null for this entry's BuildingInfo.");
+            Debug.LogWarning("Box Fill object prefab is null for this entry's Fill BuildingInfo.");
             return;
         }
         StartPlacementSetup(entry, ActivePlacementMode.BoxFill);
@@ -409,9 +481,10 @@ public class LinePlacer : MonoBehaviour
 
     public void ActivateLineLoopFillMode(PlaceableObjectEntry entry)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        if (entry.lineBuildingInfo == null || (entry.lineBuildingInfo.buildingPrefab == null && entry.lineBuildingInfo.buildingGhostPrefab == null) ||
+            entry.fillBuildingInfo == null || (entry.fillBuildingInfo.buildingPrefab == null && entry.fillBuildingInfo.buildingGhostPrefab == null))
         {
-            Debug.LogWarning("Line Loop Fill object prefab is null for this entry's BuildingInfo.");
+            Debug.LogWarning("Line Loop Fill mode requires both Line and Fill prefabs to be assigned.");
             return;
         }
         StartPlacementSetup(entry, ActivePlacementMode.LineLoopFill);
@@ -419,20 +492,20 @@ public class LinePlacer : MonoBehaviour
 
     public void ActivateLineCircleMode(PlaceableObjectEntry entry)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        if (entry.lineBuildingInfo == null || (entry.lineBuildingInfo.buildingPrefab == null && entry.lineBuildingInfo.buildingGhostPrefab == null))
         {
-            Debug.LogWarning("Line Circle object prefab is null for this entry's BuildingInfo.");
+            Debug.LogWarning("Line Circle object prefab is null for this entry's Line BuildingInfo.");
             return;
         }
         StartPlacementSetup(entry, ActivePlacementMode.LineCircle);
     }
 
-    // NEW: Activate Line Circle Fill Placement Mode
     public void ActivateLineCircleFillMode(PlaceableObjectEntry entry)
     {
-        if (entry.buildingInfo == null || (entry.buildingInfo.buildingPrefab == null && entry.buildingInfo.buildingGhostPrefab == null))
+        if (entry.lineBuildingInfo == null || (entry.lineBuildingInfo.buildingPrefab == null && entry.lineBuildingInfo.buildingGhostPrefab == null) ||
+            entry.fillBuildingInfo == null || (entry.fillBuildingInfo.buildingPrefab == null && entry.fillBuildingInfo.buildingGhostPrefab == null))
         {
-            Debug.LogWarning("Line Circle Fill object prefab is null for this entry's BuildingInfo.");
+            Debug.LogWarning("Line Circle Fill mode requires both Line and Fill prefabs to be assigned.");
             return;
         }
         StartPlacementSetup(entry, ActivePlacementMode.LineCircleFill);
@@ -445,22 +518,57 @@ public class LinePlacer : MonoBehaviour
         ClearObjectPreviews();
     }
 
-    public void ExitPlacementMode()
+    // Added optional parameter to control parent destruction
+    public void ExitPlacementMode(bool forceDestroyParent = true)
     {
         currentState = LinePlacementState.Idle;
         _currentActiveMode = ActivePlacementMode.None;
         _currentSelectedEntry = null;
-        _currentActivePlacementPrefab = null;
-        _currentActiveGhostPrefab = null;
+        _currentActiveLinePlacementPrefab = null;
+        _currentActiveLineGhostPrefab = null;
+        _currentActiveFillPlacementPrefab = null;
+        _currentActiveFillGhostPrefab = null;
         linePoints.Clear();
         DisableVisualAids();
         _isDraggingBox = false;
         _isDrawingCircle = false;
         _circleRadius = 0;
 
+        isLineFillActive = false; // Set line fill to inactive when exiting placement mode
+
+        // Destroy the current placement parent ONLY if forced or if it has no children
+        // (meaning no objects were successfully placed in it)
+        if (_currentPlacementParent != null)
+        {
+            if (forceDestroyParent || _currentPlacementParent.transform.childCount == 0)
+            {
+                Destroy(_currentPlacementParent);
+            }
+            // If not destroyed, just nullify the reference so a new one is made next time
+            _currentPlacementParent = null;
+        }
+
         SetAllPlacementButtonsInteractable(true);
 
         Debug.Log("Placement Mode Exited. Select a placement option via buttons.");
+    }
+
+    // New: Instantiates a parent GameObject for newly placed objects
+    // It now takes an initial position.
+    private GameObject InstantiatePlacementParent(Vector3 initialPosition)
+    {
+        GameObject parent;
+        if (parentObjectPrefab != null)
+        {
+            parent = Instantiate(parentObjectPrefab, initialPosition, Quaternion.identity);
+            parent.name = parentObjectPrefab.name + "_Parent_Placed";
+        }
+        else
+        {
+            parent = new GameObject("Placed_Objects_Parent");
+            parent.transform.position = initialPosition;
+        }
+        return parent;
     }
 
     void Update()
@@ -477,7 +585,9 @@ public class LinePlacer : MonoBehaviour
                 break;
             case LinePlacementState.DrawingLine:
                 HandleDrawingLineInput();
-                UpdateLineObjectPreviews(false);
+                // Pass true for closedLoop if it's a loop mode, and if there are enough points
+                bool isLoopMode = (_currentActiveMode == ActivePlacementMode.LineLoop || _currentActiveMode == ActivePlacementMode.LineLoopFill) && linePoints.Count >= 3;
+                UpdateLineObjectPreviews(isLoopMode);
                 break;
             case LinePlacementState.DrawingBox:
                 HandleDrawingBoxInput();
@@ -536,7 +646,7 @@ public class LinePlacer : MonoBehaviour
                     currentState = LinePlacementState.DrawingLine;
                     Debug.Log("First line point placed. Continue clicking to add more points.");
                 }
-                else if (_currentActiveMode == ActivePlacementMode.LineCircle || _currentActiveMode == ActivePlacementMode.LineCircleFill) // NEW
+                else if (_currentActiveMode == ActivePlacementMode.LineCircle || _currentActiveMode == ActivePlacementMode.LineCircleFill)
                 {
                     _circleCenter = _mouseWorldPosition;
                     _isDrawingCircle = true;
@@ -552,7 +662,8 @@ public class LinePlacer : MonoBehaviour
         }
         else if (Input.GetMouseButtonDown(1))
         {
-            ExitPlacementMode();
+            // When cancelling during Idle state, always destroy the parent if it's empty
+            ExitPlacementMode(forceDestroyParent: true);
         }
     }
 
@@ -579,32 +690,24 @@ public class LinePlacer : MonoBehaviour
             {
                 if (_currentActiveMode == ActivePlacementMode.Line)
                 {
-                    UpdateLineObjectPreviews(true); // Recalculate previews without the mouse-dragged point
                     PlaceAllObjectsFromLine();
                 }
-                else if (_currentActiveMode == ActivePlacementMode.LineLoop)
+                else
                 {
                     if (linePoints.Count >= 3) // Need at least 3 points for a meaningful loop
                     {
-                        UpdateLineObjectPreviews(true); // Update previews with the closing segment
-                        PlaceAllObjectsFromLineLoop();
+                        if (_currentActiveMode == ActivePlacementMode.LineLoop)
+                        {
+                            PlaceAllObjectsFromLineLoop();
+                        }
+                        else if (_currentActiveMode == ActivePlacementMode.LineLoopFill)
+                        {
+                            PlaceAllObjectsFromLineLoopFill();
+                        }
                     }
                     else
                     {
-                        Debug.Log("Need at least 3 points to finalize a line loop for placement.");
-                    }
-                }
-                else if (_currentActiveMode == ActivePlacementMode.LineLoopFill)
-                {
-                    if (linePoints.Count >= 3)
-                    {
-                        // Update previews with the closing segment and fill
-                        UpdateLineObjectPreviews(true); // This will show the perimeter, filling needs separate logic
-                        PlaceAllObjectsFromLineLoopFill();
-                    }
-                    else
-                    {
-                        Debug.Log("Need at least 3 points to finalize a line loop fill for placement.");
+                        Debug.Log("Need at least 3 points to finalize a line loop/loop fill for placement.");
                     }
                 }
             }
@@ -623,8 +726,14 @@ public class LinePlacer : MonoBehaviour
             else if (linePoints.Count == 1)
             {
                 linePoints.Clear();
-                currentState = LinePlacementState.Idle;
+                currentState = LinePlacementState.Idle; // Go back to idle to allow fresh start
                 Debug.Log("First point cleared. Back to waiting for first point.");
+                // If only one point was placed and now cleared, and it's not continuous, destroy parent.
+                if (!_currentSelectedEntry.isContinuous && _currentPlacementParent != null && _currentPlacementParent.transform.childCount == 0)
+                {
+                    Destroy(_currentPlacementParent);
+                    _currentPlacementParent = null;
+                }
             }
             else
             {
@@ -659,9 +768,13 @@ public class LinePlacer : MonoBehaviour
                     {
                         PlaceAllObjectsFromBoxLine(minCorner, maxCorner);
                     }
-                    else if (_currentActiveMode == ActivePlacementMode.BoxFill)
+                    else
                     {
-                        PlaceAllObjectsFromBoxFill(minCorner, maxCorner);
+                        // Explicitly check for BoxFill before calling PlaceAllObjectsFromBoxFill
+                        if (_currentActiveMode == ActivePlacementMode.BoxFill)
+                        {
+                            PlaceAllObjectsFromBoxFill(minCorner, maxCorner);
+                        }
                     }
                 }
                 else
@@ -701,7 +814,7 @@ public class LinePlacer : MonoBehaviour
                     {
                         PlaceObjectsInCircle(); // Finalize and place circle objects
                     }
-                    else if (_currentActiveMode == ActivePlacementMode.LineCircleFill) // NEW
+                    else if (_currentActiveMode == ActivePlacementMode.LineCircleFill)
                     {
                         PlaceAllObjectsFromLineCircleFill(); // Finalize and place circle fill objects
                     }
@@ -719,7 +832,6 @@ public class LinePlacer : MonoBehaviour
         }
     }
 
-
     private void UpdateBoxPreview()
     {
         if (boxPreviewLineRenderer == null || !_isDraggingBox || !_mouseWorldPositionFound)
@@ -729,7 +841,6 @@ public class LinePlacer : MonoBehaviour
         }
 
         boxPreviewLineRenderer.enabled = true;
-
         Vector3 currentMousePoint = _mouseWorldPosition;
         float previewY = _boxDrawStartPoint.y;
 
@@ -753,46 +864,942 @@ public class LinePlacer : MonoBehaviour
     private void UpdateBoxObjectPreviews()
     {
         ClearObjectPreviews();
-
-        if (_currentSelectedEntry == null || !_currentSelectedEntry.showGhost || _currentActiveGhostPrefab == null || !_isDraggingBox || !_mouseWorldPositionFound) return;
-
-        Vector3 currentMousePoint = _mouseWorldPosition;
-        Vector3 minCorner = new Vector3(Mathf.Min(_boxDrawStartPoint.x, currentMousePoint.x), _boxDrawStartPoint.y, Mathf.Min(_boxDrawStartPoint.z, currentMousePoint.z));
-        Vector3 maxCorner = new Vector3(Mathf.Max(_boxDrawStartPoint.x, currentMousePoint.x), _boxDrawStartPoint.y, Mathf.Max(_boxDrawStartPoint.z, currentMousePoint.z));
-
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
+        if (_currentSelectedEntry == null || !_currentSelectedEntry.showGhost || !_isDraggingBox || !_mouseWorldPositionFound) return;
 
         // Generate and show previews based on which prefabs are assigned for the current entry
-        // In this setup, _currentActiveGhostPrefab serves for both line and fill previews if it's assigned
-        if (_currentActiveMode == ActivePlacementMode.Box || _currentActiveMode == ActivePlacementMode.BoxLine)
+        if ((_currentActiveMode == ActivePlacementMode.Box || _currentActiveMode == ActivePlacementMode.BoxLine) && _currentActiveLineGhostPrefab != null)
         {
-            GenerateBoxLinePreviews(minCorner, maxCorner, _currentActiveGhostPrefab, boundsExtents, objectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
+            // NEW: Call the new GenerateBoxLinePreviews instead
+            Vector3 lineBoundsExtents = _currentSelectedEntry.lineBuildingInfo.buildingBoundsExtents;
+            GenerateBoxLinePreviews(GetCurrentBoxMinCorner(), GetCurrentBoxMaxCorner(), _currentActiveLineGhostPrefab, lineBoundsExtents, objectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
         }
-        if (_currentActiveMode == ActivePlacementMode.Box || _currentActiveMode == ActivePlacementMode.BoxFill)
+        if ((_currentActiveMode == ActivePlacementMode.Box || _currentActiveMode == ActivePlacementMode.BoxFill) && _currentActiveFillGhostPrefab != null)
         {
-            GenerateBoxFillPreviews(minCorner, maxCorner, _currentActiveGhostPrefab, boundsExtents, fillObjectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
+            Vector3 fillBoundsExtents = _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents;
+            GenerateBoxFillPreviews(GetCurrentBoxMinCorner(), GetCurrentBoxMaxCorner(), _currentActiveFillGhostPrefab, fillBoundsExtents, fillObjectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
         }
+    }
+
+    private Vector3 GetCurrentBoxMinCorner()
+    {
+        return new Vector3(Mathf.Min(_boxDrawStartPoint.x, _mouseWorldPosition.x), _boxDrawStartPoint.y, Mathf.Min(_boxDrawStartPoint.z, _mouseWorldPosition.z));
+    }
+
+    private Vector3 GetCurrentBoxMaxCorner()
+    {
+        return new Vector3(Mathf.Max(_boxDrawStartPoint.x, _mouseWorldPosition.x), _boxDrawStartPoint.y, Mathf.Max(_boxDrawStartPoint.z, _mouseWorldPosition.z));
     }
 
     // Updates live previews for objects along the circumference of a circle
     private void UpdateCircleObjectPreviews()
     {
         ClearObjectPreviews();
+        if (_currentSelectedEntry == null || !_currentSelectedEntry.showGhost || !_isDrawingCircle || !_mouseWorldPositionFound || _circleRadius <= 0) return;
 
-        if (_currentSelectedEntry == null || !_currentSelectedEntry.showGhost || _currentActiveGhostPrefab == null || !_isDrawingCircle || !_mouseWorldPositionFound || _circleRadius <= 0) return;
+        if ((_currentActiveMode == ActivePlacementMode.LineCircle || _currentActiveMode == ActivePlacementMode.LineCircleFill) && _currentActiveLineGhostPrefab != null)
+        {
+            Vector3 lineBoundsExtents = _currentSelectedEntry.lineBuildingInfo.buildingBoundsExtents;
+            float objectLength = lineBoundsExtents.z * 2;
+            float objectWidth = lineBoundsExtents.x * 2;
+            float effectiveObjectSize = objectLength + objectSpacing;
 
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
+            // Calculate circumference
+            float circumference = 2 * Mathf.PI * _circleRadius;
+            int numberOfObjects = Mathf.FloorToInt(circumference / effectiveObjectSize);
+
+            if (numberOfObjects > 0)
+            {
+                float angleStep = 360f / numberOfObjects;
+                for (int i = 0; i < numberOfObjects; i++)
+                {
+                    float angle = i * angleStep;
+                    Vector3 pointOnCircle = _circleCenter + new Vector3(Mathf.Cos(Mathf.Deg2Rad * angle), 0, Mathf.Sin(Mathf.Deg2Rad * angle)) * _circleRadius;
+
+                    RaycastHit hit;
+                    if (RaycastToTerrain(pointOnCircle + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                    {
+                        pointOnCircle.y = hit.point.y;
+                    }
+                    else
+                    {
+                        // If raycast fails, use the original interpolated y or some default
+                        // For now, let's just use the interpolated y if terrain not found.
+                        continue;
+                    }
+
+                    Vector3 direction = (pointOnCircle - _circleCenter).normalized; // Direction from center to object
+                    Quaternion objectRotation = Quaternion.LookRotation(direction);
+
+                    if (objectsRotatedRightOfLine)
+                    {
+                        objectRotation *= Quaternion.Euler(0, 90, 0); // Rotate 90 degrees relative to the radial direction
+                        Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
+                        pointOnCircle += perpendicularOffset;
+                    }
+
+                    bool isValid = IsValidPlacement(pointOnCircle, lineBoundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
+                    GameObject preview = Instantiate(_currentActiveLineGhostPrefab, pointOnCircle, objectRotation);
+                    currentObjectPreviews.Add(preview);
+                    SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
+                }
+            }
+        }
+
+        // NEW: If LineCircleFill, also show a preview of the fill.
+        if (_currentActiveMode == ActivePlacementMode.LineCircleFill && _currentActiveFillGhostPrefab != null)
+        {
+            Vector3 fillBoundsExtents = _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents;
+            GenerateCircleFillPreviews(_circleCenter, _circleRadius, _currentActiveFillGhostPrefab, fillBoundsExtents, fillObjectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
+        }
+    }
+
+    // NEW: Method to update live previews for objects along a line, including loops
+    private void UpdateLineObjectPreviews(bool isClosedLoop)
+    {
+        ClearObjectPreviews();
+        if (_currentSelectedEntry == null || !_currentSelectedEntry.showGhost || _currentActiveLineGhostPrefab == null || linePoints.Count < 1 || !_mouseWorldPositionFound) return;
+
+        Vector3 lineBoundsExtents = _currentSelectedEntry.lineBuildingInfo.buildingBoundsExtents;
+        float objectLength = lineBoundsExtents.z * 2;
+        float objectWidth = lineBoundsExtents.x * 2;
         float effectiveObjectSize = objectLength + objectSpacing;
 
-        // Calculate circumference
+        List<Vector3> currentPath = new List<Vector3>(linePoints);
+        if (linePoints.Count > 0)
+        {
+            // Add the current mouse position as the potential next point
+            currentPath.Add(_mouseWorldPosition);
+        }
+
+        if (currentPath.Count < 2) return; // Only generate previews if there are enough points
+
+        // Check for minimum points required for specific modes to show previews
+        if (_currentActiveMode == ActivePlacementMode.Line && currentPath.Count < 2) return;
+        if ((_currentActiveMode == ActivePlacementMode.LineLoop || _currentActiveMode == ActivePlacementMode.LineLoopFill) && currentPath.Count < 3) return;
+
+        List<Vector3> interpolatedPoints = new List<Vector3>();
+
+        // Generate interpolated points for smooth curves
+        for (int i = 0; i < currentPath.Count - 1; i++)
+        {
+            Vector3 p0 = i == 0 ? currentPath[0] : currentPath[i - 1]; // Use first point twice if at start
+            Vector3 p1 = currentPath[i];
+            Vector3 p2 = currentPath[i + 1];
+            Vector3 p3 = (i + 2 >= currentPath.Count) ? currentPath[currentPath.Count - 1] : currentPath[i + 2]; // Use last point twice if at end
+
+            for (int j = 0; j <= curveResolution; j++)
+            {
+                float t = (float)j / curveResolution;
+                // Catmull-Rom spline interpolation
+                Vector3 interpolatedPoint = GetCatmullRomPosition(t, p0, p1, p2, p3);
+
+                RaycastHit hit;
+                if (RaycastToTerrain(interpolatedPoint + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                {
+                    interpolatedPoint.y = hit.point.y;
+                }
+                else
+                {
+                    // If raycast fails, use the original interpolated y or some default
+                    // For now, let's just use the interpolated y if terrain not found.
+                }
+                interpolatedPoints.Add(interpolatedPoint);
+            }
+        }
+
+        // Add interpolated points for the closing segment if it's a closed loop
+        if (isClosedLoop && currentPath.Count >= 3)
+        {
+            Vector3 p0_loop = currentPath[currentPath.Count - 2];
+            Vector3 p1_loop = currentPath[currentPath.Count - 1];
+            Vector3 p2_loop = currentPath[0];
+            Vector3 p3_loop = currentPath[1];
+
+            for (int j = 0; j <= curveResolution; j++)
+            {
+                float t = (float)j / curveResolution;
+                Vector3 interpolatedPoint = GetCatmullRomPosition(t, p0_loop, p1_loop, p2_loop, p3_loop);
+                RaycastHit hit;
+                if (RaycastToTerrain(interpolatedPoint + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                {
+                    interpolatedPoint.y = hit.point.y;
+                }
+                interpolatedPoints.Add(interpolatedPoint);
+            }
+        }
+
+        // Generate objects along the interpolated path using the new generic preview function
+        GenerateObjectsAlongPathPreviews(interpolatedPoints, _currentActiveLineGhostPrefab, lineBoundsExtents, objectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid, objectsRotatedRightOfLine, curveResolution);
+
+        // NEW: If it's a fill mode, also show a preview of the fill
+        if (_currentActiveMode == ActivePlacementMode.LineLoopFill && _currentActiveFillGhostPrefab != null && linePoints.Count >= 2)
+        {
+            Vector3 fillBoundsExtents = _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents;
+            GenerateLineLoopFillPreviews(linePoints, _mouseWorldPosition, _currentActiveFillGhostPrefab, fillBoundsExtents, fillObjectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
+        }
+    }
+
+    // Generic method to clear all active ghost/preview objects
+    private void ClearObjectPreviews()
+    {
+        foreach (GameObject preview in currentObjectPreviews)
+        {
+            if (preview != null)
+            {
+                Destroy(preview);
+            }
+        }
+        currentObjectPreviews.Clear();
+    }
+
+    // Generic method to set the material of a preview object
+    private void SetPreviewMaterial(GameObject preview, Material material)
+    {
+        MeshRenderer[] renderers = preview.GetComponentsInChildren<MeshRenderer>();
+        foreach (MeshRenderer renderer in renderers)
+        {
+            renderer.sharedMaterial = material;
+        }
+    }
+
+    // Performs a raycast from a point high above downwards to find terrain
+    private bool RaycastToTerrain(Vector3 startPoint, out RaycastHit hit, LayerMask layerMask)
+    {
+        return Physics.Raycast(startPoint, Vector3.down, out hit, Mathf.Infinity, layerMask);
+    }
+
+    // Checks if a placement position is valid (no overlaps, valid grid cell)
+    private bool IsValidPlacement(Vector3 position, Vector3 boundsExtents, bool canOverlap, bool occupyGrid)
+    {
+        if (!canOverlap)
+        {
+            Collider[] colliders = Physics.OverlapBox(position, boundsExtents, Quaternion.identity, overlapCheckLayerMask);
+            // Filter out self-colliders if they exist (e.g., if the ghost prefab has a collider)
+            if (colliders.Length > 0)
+            {
+                // Simple check: if any collider exists, it's an overlap.
+                // More complex logic might check if it's an *existing placed object* vs. a new ghost.
+                // For now, any overlap means invalid.
+                return false;
+            }
+        }
+        if (occupyGrid)
+        {
+            Vector2Int gridPos = WorldToGrid(position);
+            if (_occupiedGridCells.Contains(gridPos))
+            {
+                return false; // Cell already occupied
+            }
+        }
+        return true;
+    }
+
+    // Converts world position to grid cell coordinates
+    private Vector2Int WorldToGrid(Vector3 worldPosition)
+    {
+        return new Vector2Int(
+            Mathf.FloorToInt(worldPosition.x / gridSize),
+            Mathf.FloorToInt(worldPosition.z / gridSize)
+        );
+    }
+
+    // Marks grid cells as occupied (e.g., after placing an object)
+    private void MarkGridCellsOccupied(Vector3 position, Vector3 boundsExtents)
+    {
+        // For simplicity, mark only the center cell.
+        // For more precise occupation, iterate over all cells covered by the bounds.
+        _occupiedGridCells.Add(WorldToGrid(position));
+    }
+
+
+    // ------------------------------------------------------------------------------------------------------
+    // NEW Helper Methods for Generating Previews & Placement (Refactored from previous logic)
+    // These methods centralize the logic for drawing different types of objects for previews and final placement.
+    // ------------------------------------------------------------------------------------------------------
+
+    // New: Generates previews for objects along a line path
+    // Used by UpdateLineObjectPreviews
+    private void GenerateObjectsAlongPathPreviews(List<Vector3> pathPoints, GameObject ghostPrefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid, bool rotatedRightOfLine, int curveResolution)
+    {
+        if (pathPoints.Count < 2 || ghostPrefab == null) return;
+
+        float objectLength = boundsExtents.z * 2;
+        float objectWidth = boundsExtents.x * 2;
+        float effectiveObjectSize = objectLength + spacing;
+        float currentDistance = 0f;
+        Vector3 previousPoint = pathPoints[0];
+
+        // Ensure the first object is placed
+        Vector3 initialDirection = (pathPoints[1] - pathPoints[0]).normalized;
+        Quaternion initialRotation = Quaternion.LookRotation(initialDirection);
+        Vector3 initialPos = pathPoints[0];
+
+        if (rotatedRightOfLine)
+        {
+            initialRotation *= Quaternion.Euler(0, 90, 0);
+            Vector3 perpendicularOffset = initialRotation * Vector3.forward * (objectWidth / 2f);
+            initialPos += perpendicularOffset;
+        }
+
+        // Always attempt to place the first object, even if distance is 0, if there are multiple points
+        if (pathPoints.Count > 1) {
+             bool isValidFirst = IsValidPlacement(initialPos, boundsExtents, canOverlap, occupyGrid);
+             GameObject previewFirst = Instantiate(ghostPrefab, initialPos, initialRotation);
+             currentObjectPreviews.Add(previewFirst);
+             SetPreviewMaterial(previewFirst, isValidFirst ? validPlacementMaterial : invalidPlacementMaterial);
+        }
+
+
+        for (int i = 1; i < pathPoints.Count; i++)
+        {
+            Vector3 currentPoint = pathPoints[i];
+            float segmentLength = Vector3.Distance(previousPoint, currentPoint);
+            currentDistance += segmentLength;
+
+            while (currentDistance >= effectiveObjectSize)
+            {
+                currentDistance -= effectiveObjectSize;
+
+                // Calculate exact position along the segment
+                float overshoot = effectiveObjectSize - segmentLength + currentDistance; // how much past current point
+                Vector3 position = Vector3.Lerp(currentPoint, previousPoint, overshoot / segmentLength);
+
+                RaycastHit hit;
+                if (RaycastToTerrain(position + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                {
+                    position.y = hit.point.y;
+                }
+                else
+                {
+                    continue; // Skip if no terrain found
+                }
+
+                Vector3 direction = (currentPoint - previousPoint).normalized;
+                Quaternion objectRotation = Quaternion.LookRotation(direction);
+
+                if (rotatedRightOfLine)
+                {
+                    objectRotation *= Quaternion.Euler(0, 90, 0); // Rotate 90 degrees relative to the line direction
+                    Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
+                    position += perpendicularOffset;
+                }
+
+                bool isValid = IsValidPlacement(position, boundsExtents, canOverlap, occupyGrid);
+                GameObject preview = Instantiate(ghostPrefab, position, objectRotation);
+                currentObjectPreviews.Add(preview);
+                SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
+            }
+            previousPoint = currentPoint;
+        }
+    }
+
+
+    // New: Generates previews for objects filling a box area
+    // Used by UpdateBoxObjectPreviews
+    private void GenerateBoxFillPreviews(Vector3 minCorner, Vector3 maxCorner, GameObject ghostPrefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
+    {
+        if (ghostPrefab == null) return;
+
+        float objectWidth = boundsExtents.x * 2;
+        float objectLength = boundsExtents.z * 2;
+        float stepX = objectWidth + spacing;
+        float stepZ = objectLength + spacing;
+
+        // Ensure a minimum size to avoid infinite loops with tiny objects/spacing
+        if (stepX <= 0 || stepZ <= 0) return;
+
+        for (float x = minCorner.x + boundsExtents.x; x < maxCorner.x; x += stepX)
+        {
+            for (float z = minCorner.z + boundsExtents.z; z < maxCorner.z; z += stepZ)
+            {
+                Vector3 position = new Vector3(x, minCorner.y, z);
+
+                RaycastHit hit;
+                if (RaycastToTerrain(position + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                {
+                    position.y = hit.point.y;
+                }
+                else
+                {
+                    continue; // Skip if no terrain found
+                }
+
+                bool isValid = IsValidPlacement(position, boundsExtents, canOverlap, occupyGrid);
+                GameObject preview = Instantiate(ghostPrefab, position, Quaternion.identity);
+                currentObjectPreviews.Add(preview);
+                SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
+            }
+        }
+    }
+
+    // New: Generates previews for objects along the perimeter of a box
+    // Used by UpdateBoxObjectPreviews
+    private void GenerateBoxLinePreviews(Vector3 minCorner, Vector3 maxCorner, GameObject ghostPrefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
+    {
+        if (ghostPrefab == null) return;
+
+        float objectLength = boundsExtents.z * 2;
+        float objectWidth = boundsExtents.x * 2; // For perpendicular offset
+        float effectiveObjectSize = objectLength + spacing;
+
+        // Define corners for iterating along the perimeter
+        Vector3 p1 = new Vector3(minCorner.x, minCorner.y, minCorner.z);
+        Vector3 p2 = new Vector3(maxCorner.x, minCorner.y, minCorner.z);
+        Vector3 p3 = new Vector3(maxCorner.x, minCorner.y, maxCorner.z);
+        Vector3 p4 = new Vector3(minCorner.x, minCorner.y, maxCorner.z);
+
+        List<Vector3> perimeterPoints = new List<Vector3> { p1, p2, p3, p4, p1 }; // Closing the loop
+
+        // Use the generic path preview generator
+        GenerateObjectsAlongPathPreviews(perimeterPoints, ghostPrefab, boundsExtents, spacing, canOverlap, occupyGrid, objectsRotatedRightOfLine, curveResolution);
+    }
+
+
+    // New: Generates previews for objects filling a circle area
+    // Used by UpdateCircleObjectPreviews
+    private void GenerateCircleFillPreviews(Vector3 center, float radius, GameObject ghostPrefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
+    {
+        if (ghostPrefab == null || radius <= 0) return;
+
+        float objectWidth = boundsExtents.x * 2;
+        float objectLength = boundsExtents.z * 2;
+        float step = Mathf.Min(objectWidth, objectLength) + spacing; // Use smaller dimension for stepping
+
+        if (step <= 0) return;
+
+        // Iterate in a square grid within the circle's bounding box
+        for (float x = center.x - radius; x <= center.x + radius; x += step)
+        {
+            for (float z = center.z - radius; z <= center.z + radius; z += step)
+            {
+                Vector3 position = new Vector3(x, center.y, z);
+
+                // Check if the current position is within the circle
+                if (Vector3.Distance(center, new Vector3(position.x, center.y, position.z)) <= radius)
+                {
+                    RaycastHit hit;
+                    if (RaycastToTerrain(position + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                    {
+                        position.y = hit.point.y;
+                    }
+                    else
+                    {
+                        continue; // Skip if no terrain found
+                    }
+
+                    bool isValid = IsValidPlacement(position, boundsExtents, canOverlap, occupyGrid);
+                    GameObject preview = Instantiate(ghostPrefab, position, Quaternion.identity);
+                    currentObjectPreviews.Add(preview);
+                    SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
+                }
+            }
+        }
+    }
+
+    // New: Generates previews for objects filling a line loop area
+    // Used by UpdateLineObjectPreviews
+    private void GenerateLineLoopFillPreviews(List<Vector3> currentLinePoints, Vector3 mouseWorldPosition, GameObject ghostPrefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
+    {
+        if (currentLinePoints.Count < 2 || ghostPrefab == null) return;
+
+        List<Vector3> loopPoints = new List<Vector3>(currentLinePoints);
+        loopPoints.Add(mouseWorldPosition); // Add mouse position to form the temporary loop
+
+        if (loopPoints.Count < 3) return; // Need at least 3 points for a valid polygon
+
+        // Calculate bounding box of the loop
+        float minX = loopPoints.Min(p => p.x);
+        float maxX = loopPoints.Max(p => p.x);
+        float minZ = loopPoints.Min(p => p.z);
+        float maxZ = loopPoints.Max(p => p.z);
+
+        float objectWidth = boundsExtents.x * 2;
+        float objectLength = boundsExtents.z * 2;
+        float stepX = objectWidth + spacing;
+        float stepZ = objectLength + spacing;
+
+        if (stepX <= 0 || stepZ <= 0) return;
+
+        for (float x = minX + boundsExtents.x; x < maxX; x += stepX)
+        {
+            for (float z = minZ + boundsExtents.z; z < maxZ; z += stepZ)
+            {
+                Vector3 position = new Vector3(x, loopPoints[0].y, z); // Use Y from first point, will be raycast corrected
+
+                // Check if point is inside the polygon (2D check on XZ plane)
+                if (IsPointInPolygon(new Vector2(position.x, position.z), loopPoints.Select(p => new Vector2(p.x, p.z)).ToList()))
+                {
+                    RaycastHit hit;
+                    if (RaycastToTerrain(position + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                    {
+                        position.y = hit.point.y;
+                    }
+                    else
+                    {
+                        continue; // Skip if no terrain found
+                    }
+
+                    bool isValid = IsValidPlacement(position, boundsExtents, canOverlap, occupyGrid);
+                    GameObject preview = Instantiate(ghostPrefab, position, Quaternion.identity);
+                    currentObjectPreviews.Add(preview);
+                    SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
+                }
+            }
+        }
+    }
+
+
+    // Helper for Catmull-Rom spline interpolation
+    private Vector3 GetCatmullRomPosition(float t, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3)
+    {
+        // Catmull-Rom spline formula
+        Vector3 a = 2f * p1;
+        Vector3 b = p2 - p0;
+        Vector3 c = 2f * p0 - 5f * p1 + 4f * p2 - p3;
+        Vector3 d = -p0 + 3f * p1 - 3f * p2 + p3;
+
+        return 0.5f * (a + (b * t) + (c * t * t) + (d * t * t * t));
+    }
+
+
+    // Helper for point-in-polygon test (ray casting algorithm)
+    private bool IsPointInPolygon(Vector2 point, List<Vector2> polygon)
+    {
+        int polygonLength = polygon.Count;
+        bool inside = false;
+
+        for (int i = 0, j = polygonLength - 1; i < polygonLength; j = i++)
+        {
+            if (((polygon[i].y > point.y) != (polygon[j].y > point.y)) &&
+                (point.x < (polygon[j].x - polygon[i].x) * (point.y - polygon[i].y) / (polygon[j].y - polygon[i].y) + polygon[i].x))
+            {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+
+    // ------------------------------------------------------------------------------------------------------
+    // Final Placement Methods (Called when user finalizes a shape)
+    // These methods instantiate the actual objects and handle grid occupation/mesh combining.
+    // ------------------------------------------------------------------------------------------------------
+
+    // Sets interactability of all placement buttons
+    private void SetAllPlacementButtonsInteractable(bool interactable)
+    {
+        foreach (var entry in placeableObjectEntries)
+        {
+            if (entry.lineButton != null) entry.lineButton.interactable = interactable;
+            if (entry.boxAndFillButton != null) entry.boxAndFillButton.interactable = interactable;
+            if (entry.lineLoopButton != null) entry.lineLoopButton.interactable = interactable;
+            if (entry.boxLineButton != null) entry.boxLineButton.interactable = interactable;
+            if (entry.boxFillButton != null) entry.boxFillButton.interactable = interactable;
+            if (entry.lineLoopFillButton != null) entry.lineLoopFillButton.interactable = interactable;
+            if (entry.lineCircleButton != null) entry.lineCircleButton.interactable = interactable;
+            if (entry.lineCircleFillButton != null) entry.lineCircleFillButton.interactable = interactable;
+
+            // Re-evaluate interactability based on prefab presence if re-enabling
+            if (interactable)
+            {
+                bool hasValidLinePrefab = entry.lineBuildingInfo != null && (entry.lineBuildingInfo.buildingPrefab != null || entry.lineBuildingInfo.buildingGhostPrefab != null);
+                bool hasValidFillPrefab = entry.fillBuildingInfo != null && (entry.fillBuildingInfo.buildingPrefab != null || entry.fillBuildingInfo.buildingGhostPrefab != null);
+
+                if (entry.lineButton != null) entry.lineButton.interactable = hasValidLinePrefab;
+                if (entry.boxAndFillButton != null) entry.boxAndFillButton.interactable = hasValidLinePrefab && hasValidFillPrefab;
+                if (entry.lineLoopButton != null) entry.lineLoopButton.interactable = hasValidLinePrefab;
+                if (entry.boxLineButton != null) entry.boxLineButton.interactable = hasValidLinePrefab;
+                if (entry.boxFillButton != null) entry.boxFillButton.interactable = hasValidFillPrefab;
+                if (entry.lineLoopFillButton != null) entry.lineLoopFillButton.interactable = hasValidLinePrefab && hasValidFillPrefab;
+                if (entry.lineCircleButton != null) entry.lineCircleButton.interactable = hasValidLinePrefab;
+                if (entry.lineCircleFillButton != null) entry.lineCircleFillButton.interactable = hasValidLinePrefab && hasValidFillPrefab;
+            }
+        }
+    }
+
+
+    // New: Places objects along the perimeter of a given box
+    private void PlaceAllObjectsFromBoxLine(Vector3 minCorner, Vector3 maxCorner)
+    {
+        if (_currentActiveLinePlacementPrefab == null)
+        {
+            Debug.LogError("Box Line Placement: Line prefab is not assigned.");
+            ExitPlacementMode();
+            return;
+        }
+
+        // Check if the size is too small before attempting placement
+        float boxWidth = Mathf.Abs(maxCorner.x - minCorner.x);
+        float boxLength = Mathf.Abs(maxCorner.z - minCorner.z);
+        if (boxWidth < minBoxSize || boxLength < minBoxSize)
+        {
+            Debug.LogWarning($"Box too small for placement. Minimum size: {minBoxSize}x{minBoxSize}. Current: {boxWidth:F2}x{boxLength:F2}.");
+            ExitPlacementMode();
+            return;
+        }
+
+        // Define corners for iterating along the perimeter
+        Vector3 p1 = new Vector3(minCorner.x, minCorner.y, minCorner.z);
+        Vector3 p2 = new Vector3(maxCorner.x, minCorner.y, minCorner.z);
+        Vector3 p3 = new Vector3(maxCorner.x, minCorner.y, maxCorner.z);
+        Vector3 p4 = new Vector3(minCorner.x, minCorner.y, maxCorner.z);
+
+        List<Vector3> perimeterPoints = new List<Vector3> { p1, p2, p3, p4, p1 }; // Closing the loop
+
+        List<GameObject> placedObjects = new List<GameObject>();
+        PlaceObjectsAlongPath(perimeterPoints, _currentActiveLinePlacementPrefab, _currentSelectedEntry.lineBuildingInfo.buildingBoundsExtents, objectSpacing,
+                              _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid, objectsRotatedRightOfLine, curveResolution, placedObjects);
+
+        if (_currentSelectedEntry.combineLineMeshes && placedObjects.Count > 0)
+        {
+            CombineMeshes(placedObjects, _currentActiveLinePlacementPrefab.GetComponent<MeshRenderer>()?.sharedMaterial, "CombinedLineMesh");
+        }
+
+        Debug.Log($"Box Line placement complete. Placed {placedObjects.Count} objects.");
+
+        if (!_currentSelectedEntry.isContinuous)
+        {
+            ExitPlacementMode();
+        }
+        else
+        {
+            // For continuous mode, reset state for next placement
+            currentState = LinePlacementState.Idle;
+            ClearObjectPreviews();
+            _isDraggingBox = false;
+        }
+    }
+
+    // New: Places objects filling a box area
+    private void PlaceAllObjectsFromBoxFill(Vector3 minCorner, Vector3 maxCorner)
+    {
+        if (_currentActiveFillPlacementPrefab == null)
+        {
+            Debug.LogError("Box Fill Placement: Fill prefab is not assigned.");
+            ExitPlacementMode();
+            return;
+        }
+
+        float boxWidth = Mathf.Abs(maxCorner.x - minCorner.x);
+        float boxLength = Mathf.Abs(maxCorner.z - minCorner.z);
+        if (boxWidth < minBoxSize || boxLength < minBoxSize)
+        {
+            Debug.LogWarning($"Box too small for placement. Minimum size: {minBoxSize}x{minBoxSize}. Current: {boxWidth:F2}x{boxLength:F2}.");
+            ExitPlacementMode();
+            return;
+        }
+
+        List<GameObject> placedObjects = new List<GameObject>();
+        float objectWidth = _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents.x * 2;
+        float objectLength = _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents.z * 2;
+        float stepX = objectWidth + fillObjectSpacing;
+        float stepZ = objectLength + fillObjectSpacing;
+
+        if (stepX <= 0 || stepZ <= 0)
+        {
+            Debug.LogError("Invalid object size or spacing for box fill. Cannot place objects.");
+            ExitPlacementMode();
+            return;
+        }
+
+
+        for (float x = minCorner.x + _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents.x; x < maxCorner.x; x += stepX)
+        {
+            for (float z = minCorner.z + _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents.z; z < maxCorner.z; z += stepZ)
+            {
+                Vector3 position = new Vector3(x, minCorner.y, z);
+
+                RaycastHit hit;
+                if (RaycastToTerrain(position + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                {
+                    position.y = hit.point.y;
+                }
+                else
+                {
+                    continue;
+                }
+
+                if (IsValidPlacement(position, _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid))
+                {
+                    GameObject obj = Instantiate(_currentActiveFillPlacementPrefab, position, Quaternion.identity, _currentPlacementParent.transform);
+                    if (_currentSelectedEntry.occupyGrid)
+                    {
+                        MarkGridCellsOccupied(position, _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents);
+                    }
+                    placedObjects.Add(obj);
+                }
+            }
+        }
+
+        if (_currentSelectedEntry.combineFillMeshes && placedObjects.Count > 0)
+        {
+            CombineMeshes(placedObjects, _currentActiveFillPlacementPrefab.GetComponent<MeshRenderer>()?.sharedMaterial, "CombinedFillMesh");
+        }
+
+        Debug.Log($"Box Fill placement complete. Placed {placedObjects.Count} objects.");
+
+        if (!_currentSelectedEntry.isContinuous)
+        {
+            ExitPlacementMode();
+        }
+        else
+        {
+            currentState = LinePlacementState.Idle;
+            ClearObjectPreviews();
+            _isDraggingBox = false;
+        }
+    }
+
+
+    // New: Places objects along both the line and fill of a box (combined mode)
+    private void PlaceAllObjectsFromCombinedBox(Vector3 minCorner, Vector3 maxCorner)
+    {
+        // Place line objects
+        PlaceAllObjectsFromBoxLine(minCorner, maxCorner);
+
+        // Place fill objects (ensure fill prefab is assigned for this combined mode)
+        if (_currentActiveFillPlacementPrefab != null)
+        {
+            PlaceAllObjectsFromBoxFill(minCorner, maxCorner);
+        }
+        else
+        {
+            Debug.LogWarning("Cannot place box fill objects: Fill prefab is not assigned for combined Box mode.");
+        }
+
+        // Exit placement mode after combined placement, unless continuous
+        if (!_currentSelectedEntry.isContinuous)
+        {
+            ExitPlacementMode();
+        }
+        else
+        {
+            currentState = LinePlacementState.Idle;
+            ClearObjectPreviews();
+            _isDraggingBox = false;
+        }
+    }
+
+
+    // New: Places objects along the perimeter defined by linePoints
+    private void PlaceAllObjectsFromLine()
+    {
+        if (_currentActiveLinePlacementPrefab == null)
+        {
+            Debug.LogError("Line Placement: Line prefab is not assigned.");
+            ExitPlacementMode();
+            return;
+        }
+
+        if (linePoints.Count < 2)
+        {
+            Debug.LogWarning("Not enough points to finalize line placement.");
+            ExitPlacementMode();
+            return;
+        }
+
+        List<GameObject> placedObjects = new List<GameObject>();
+        PlaceObjectsAlongPath(linePoints, _currentActiveLinePlacementPrefab, _currentSelectedEntry.lineBuildingInfo.buildingBoundsExtents, objectSpacing,
+                              _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid, objectsRotatedRightOfLine, curveResolution, placedObjects);
+
+        if (_currentSelectedEntry.combineLineMeshes && placedObjects.Count > 0)
+        {
+            CombineMeshes(placedObjects, _currentActiveLinePlacementPrefab.GetComponent<MeshRenderer>()?.sharedMaterial, "CombinedLineMesh");
+        }
+
+        Debug.Log($"Line placement complete. Placed {placedObjects.Count} objects.");
+
+        if (!_currentSelectedEntry.isContinuous)
+        {
+            ExitPlacementMode();
+        }
+        else
+        {
+            currentState = LinePlacementState.Idle;
+            linePoints.Clear(); // Clear points for the next continuous line
+            ClearObjectPreviews();
+        }
+    }
+
+    // New: Places objects along a closed loop defined by linePoints
+    private void PlaceAllObjectsFromLineLoop()
+    {
+        if (_currentActiveLinePlacementPrefab == null)
+        {
+            Debug.LogError("Line Loop Placement: Line prefab is not assigned.");
+            ExitPlacementMode();
+            return;
+        }
+
+        if (linePoints.Count < 3) // Need at least 3 points to form a closed loop
+        {
+            Debug.LogWarning("Not enough points to finalize line loop placement. Need at least 3 points.");
+            ExitPlacementMode();
+            return;
+        }
+
+        List<GameObject> placedObjects = new List<GameObject>();
+        List<Vector3> closedLoopPoints = new List<Vector3>(linePoints);
+        closedLoopPoints.Add(linePoints[0]); // Close the loop by adding the first point again
+
+        PlaceObjectsAlongPath(closedLoopPoints, _currentActiveLinePlacementPrefab, _currentSelectedEntry.lineBuildingInfo.buildingBoundsExtents, objectSpacing,
+                              _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid, objectsRotatedRightOfLine, curveResolution, placedObjects);
+
+        if (_currentSelectedEntry.combineLineMeshes && placedObjects.Count > 0)
+        {
+            CombineMeshes(placedObjects, _currentActiveLinePlacementPrefab.GetComponent<MeshRenderer>()?.sharedMaterial, "CombinedLineLoopMesh");
+        }
+
+        Debug.Log($"Line Loop placement complete. Placed {placedObjects.Count} objects.");
+
+        if (!_currentSelectedEntry.isContinuous)
+        {
+            ExitPlacementMode();
+        }
+        else
+        {
+            currentState = LinePlacementState.Idle;
+            linePoints.Clear();
+            ClearObjectPreviews();
+        }
+    }
+
+
+    // New: Places objects along the line and fills the area of a closed loop
+    private void PlaceAllObjectsFromLineLoopFill()
+    {
+        if (_currentActiveLinePlacementPrefab == null || _currentActiveFillPlacementPrefab == null)
+        {
+            Debug.LogError("Line Loop Fill Placement requires both Line and Fill prefabs to be assigned.");
+            ExitPlacementMode();
+            return;
+        }
+
+        if (linePoints.Count < 3)
+        {
+            Debug.LogWarning("Not enough points to finalize line loop fill placement. Need at least 3 points.");
+            ExitPlacementMode();
+            return;
+        }
+
+        // 1. Place objects along the loop line (perimeter)
+        List<GameObject> lineObjects = new List<GameObject>();
+        List<Vector3> closedLoopPoints = new List<Vector3>(linePoints);
+        closedLoopPoints.Add(linePoints[0]); // Close the loop
+        PlaceObjectsAlongPath(closedLoopPoints, _currentActiveLinePlacementPrefab, _currentSelectedEntry.lineBuildingInfo.buildingBoundsExtents, objectSpacing,
+                              _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid, objectsRotatedRightOfLine, curveResolution, lineObjects);
+
+        if (_currentSelectedEntry.combineLineMeshes && lineObjects.Count > 0)
+        {
+            CombineMeshes(lineObjects, _currentActiveLinePlacementPrefab.GetComponent<MeshRenderer>()?.sharedMaterial, "CombinedLineLoopPerimeterMesh");
+        }
+
+
+        // 2. Place objects to fill the interior
+        List<GameObject> fillObjects = new List<GameObject>();
+        float objectWidth = _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents.x * 2;
+        float objectLength = _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents.z * 2;
+        float stepX = objectWidth + fillObjectSpacing;
+        float stepZ = objectLength + fillObjectSpacing;
+
+        if (stepX <= 0 || stepZ <= 0)
+        {
+            Debug.LogError("Invalid object size or spacing for line loop fill. Cannot place objects.");
+            ExitPlacementMode();
+            return;
+        }
+
+        // Calculate bounding box of the loop
+        float minX = linePoints.Min(p => p.x);
+        float maxX = linePoints.Max(p => p.x);
+        float minZ = linePoints.Min(p => p.z);
+        float maxZ = linePoints.Max(p => p.z);
+
+        for (float x = minX + _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents.x; x < maxX; x += stepX)
+        {
+            for (float z = minZ + _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents.z; z < maxZ; z += stepZ)
+            {
+                Vector3 position = new Vector3(x, linePoints[0].y, z); // Use Y from first point, will be raycast corrected
+
+                // Check if point is inside the polygon (2D check on XZ plane)
+                if (IsPointInPolygon(new Vector2(position.x, position.z), linePoints.Select(p => new Vector2(p.x, p.z)).ToList()))
+                {
+                    RaycastHit hit;
+                    if (RaycastToTerrain(position + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                    {
+                        position.y = hit.point.y;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    if (IsValidPlacement(position, _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid))
+                    {
+                        GameObject obj = Instantiate(_currentActiveFillPlacementPrefab, position, Quaternion.identity, _currentPlacementParent.transform);
+                        if (_currentSelectedEntry.occupyGrid)
+                        {
+                            MarkGridCellsOccupied(position, _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents);
+                        }
+                        fillObjects.Add(obj);
+                    }
+                }
+            }
+        }
+
+        if (_currentSelectedEntry.combineFillMeshes && fillObjects.Count > 0)
+        {
+            CombineMeshes(fillObjects, _currentActiveFillPlacementPrefab.GetComponent<MeshRenderer>()?.sharedMaterial, "CombinedLineLoopFillMesh");
+        }
+
+        Debug.Log($"Line Loop Fill placement complete. Placed {lineObjects.Count} line objects and {fillObjects.Count} fill objects.");
+
+        if (!_currentSelectedEntry.isContinuous)
+        {
+            ExitPlacementMode();
+        }
+        else
+        {
+            currentState = LinePlacementState.Idle;
+            linePoints.Clear();
+            ClearObjectPreviews();
+        }
+    }
+
+
+    // New: Places objects around a circle
+    private void PlaceObjectsInCircle()
+    {
+        if (_currentActiveLinePlacementPrefab == null)
+        {
+            Debug.LogError("Circle Placement: Line prefab is not assigned.");
+            ExitPlacementMode();
+            return;
+        }
+        if (_circleRadius < minBoxSize)
+        {
+            Debug.LogWarning($"Circle radius too small. Minimum radius: {minBoxSize}. Current: {_circleRadius:F2}.");
+            ExitPlacementMode();
+            return;
+        }
+
+        List<GameObject> placedObjects = new List<GameObject>();
+        Vector3 lineBoundsExtents = _currentSelectedEntry.lineBuildingInfo.buildingBoundsExtents;
+        float objectLength = lineBoundsExtents.z * 2;
+        float objectWidth = lineBoundsExtents.x * 2;
+        float effectiveObjectSize = objectLength + objectSpacing;
+
         float circumference = 2 * Mathf.PI * _circleRadius;
         int numberOfObjects = Mathf.FloorToInt(circumference / effectiveObjectSize);
-        if (numberOfObjects == 0) return;
+
+        if (numberOfObjects <= 0)
+        {
+            Debug.LogWarning("No objects to place for circle: circle is too small for object spacing.");
+            ExitPlacementMode();
+            return;
+        }
 
         float angleStep = 360f / numberOfObjects;
-
         for (int i = 0; i < numberOfObjects; i++)
         {
             float angle = i * angleStep;
@@ -818,1260 +1825,294 @@ public class LinePlacer : MonoBehaviour
                 pointOnCircle += perpendicularOffset;
             }
 
-            bool isValid = IsValidPlacement(pointOnCircle, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-
-            GameObject preview = Instantiate(_currentActiveGhostPrefab, pointOnCircle, objectRotation);
-            currentObjectPreviews.Add(preview);
-            SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
-        }
-
-        // NEW: If LineCircleFill, also show a preview of the fill.
-        if (_currentActiveMode == ActivePlacementMode.LineCircleFill)
-        {
-            GenerateCircleFillPreviews(_circleCenter, _circleRadius, _currentActiveGhostPrefab, boundsExtents, fillObjectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-        }
-    }
-
-    // Helper to generate previews along a box's perimeter
-    private void GenerateBoxLinePreviews(Vector3 minCorner, Vector3 maxCorner, GameObject prefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
-    {
-        if (prefab == null) return;
-
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-        float effectiveObjectSize = objectLength + spacing;
-
-        List<Vector3> boxCorners = new List<Vector3>()
-        {
-            new Vector3(minCorner.x, 0, minCorner.z),
-            new Vector3(maxCorner.x, 0, minCorner.z),
-            new Vector3(maxCorner.x, 0, maxCorner.z),
-            new Vector3(minCorner.x, 0, maxCorner.z),
-            new Vector3(minCorner.x, 0, minCorner.z)
-        };
-
-        float currentPathDistance = 0f;
-        float nextObjectDistanceTarget = effectiveObjectSize / 2f;
-
-        for (int i = 0; i < boxCorners.Count - 1; i++)
-        {
-            Vector3 currentSegmentStart = boxCorners[i];
-            Vector3 currentSegmentEnd = boxCorners[i + 1];
-            float segmentLength = Vector3.Distance(currentSegmentStart, currentSegmentEnd);
-
-            if (segmentLength < 0.001f) continue;
-
-            RaycastHit hitStart, hitEnd;
-            if (RaycastToTerrain(currentSegmentStart + Vector3.up * terrainRaycastStartHeight, out hitStart, placementLayerMask))
-                currentSegmentStart.y = hitStart.point.y;
-            if (RaycastToTerrain(currentSegmentEnd + Vector3.up * terrainRaycastStartHeight, out hitEnd, placementLayerMask))
-                currentSegmentEnd.y = hitEnd.point.y;
-
-            while (currentPathDistance + segmentLength >= nextObjectDistanceTarget)
+            if (IsValidPlacement(pointOnCircle, lineBoundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid))
             {
-                float distanceIntoSegment = nextObjectDistanceTarget - currentPathDistance;
-                Vector3 previewPosition = Vector3.Lerp(currentSegmentStart, currentSegmentEnd, distanceIntoSegment / segmentLength);
-
-                RaycastHit hit;
-                if (RaycastToTerrain(previewPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                GameObject obj = Instantiate(_currentActiveLinePlacementPrefab, pointOnCircle, objectRotation, _currentPlacementParent.transform);
+                if (_currentSelectedEntry.occupyGrid)
                 {
-                    previewPosition = hit.point;
+                    MarkGridCellsOccupied(pointOnCircle, lineBoundsExtents);
                 }
-                else
-                {
-                    nextObjectDistanceTarget += effectiveObjectSize;
-                    continue;
-                }
-
-                Vector3 direction = (currentSegmentEnd - currentSegmentStart).normalized;
-                if (direction == Vector3.zero) direction = Vector3.forward;
-                Quaternion objectRotation = Quaternion.LookRotation(direction);
-
-                if (objectsRotatedRightOfLine)
-                {
-                    objectRotation *= Quaternion.Euler(0, 90, 0);
-                    Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
-                    previewPosition += perpendicularOffset;
-                }
-
-                bool isValid = IsValidPlacement(previewPosition, boundsExtents, canOverlap, occupyGrid);
-
-                GameObject preview = Instantiate(prefab, previewPosition, objectRotation);
-                currentObjectPreviews.Add(preview);
-                SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
-
-                nextObjectDistanceTarget += effectiveObjectSize;
-            }
-            currentPathDistance += segmentLength;
-        }
-    }
-
-    // Helper to generate previews for filling a box area
-    private void GenerateBoxFillPreviews(Vector3 minCorner, Vector3 maxCorner, GameObject prefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
-    {
-        if (prefab == null) return;
-
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-        float effectiveObjectSizeZ = objectLength + spacing;
-        float effectiveObjectSizeX = objectWidth + spacing;
-
-        for (float x = minCorner.x + effectiveObjectSizeX / 2f; x < maxCorner.x; x += effectiveObjectSizeX)
-        {
-            for (float z = minCorner.z + effectiveObjectSizeZ / 2f; z < maxCorner.z; z += effectiveObjectSizeZ)
-            {
-                Vector3 placementPosition = new Vector3(x, minCorner.y, z);
-
-                RaycastHit hit;
-                if (RaycastToTerrain(placementPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-                {
-                    placementPosition = hit.point;
-                }
-                else
-                {
-                    continue;
-                }
-
-                Quaternion objectRotation = prefab.transform.rotation;
-                if (objectsRotatedRightOfLine)
-                {
-                    objectRotation = Quaternion.Euler(0, 90, 0);
-                }
-
-                bool isValid = IsValidPlacement(placementPosition, boundsExtents, canOverlap, occupyGrid);
-
-                GameObject preview = Instantiate(prefab, placementPosition, objectRotation);
-                currentObjectPreviews.Add(preview);
-                SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
-            }
-        }
-    }
-
-    // NEW: Helper to generate previews for filling a circle area
-    private void GenerateCircleFillPreviews(Vector3 center, float radius, GameObject prefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
-    {
-        if (prefab == null) return;
-
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-        float effectiveObjectSizeZ = objectLength + spacing;
-        float effectiveObjectSizeX = objectWidth + spacing;
-
-        // Iterate through a square bounding box of the circle
-        for (float x = center.x - radius; x <= center.x + radius; x += effectiveObjectSizeX)
-        {
-            for (float z = center.z - radius; z <= center.z + radius; z += effectiveObjectSizeZ)
-            {
-                Vector3 potentialPlacement = new Vector3(x + effectiveObjectSizeX / 2f, center.y, z + effectiveObjectSizeZ / 2f);
-
-                // Check if the potential placement is within the circle's radius
-                if (Vector3.Distance(center, potentialPlacement) <= radius - (effectiveObjectSizeX / 2f)) // Subtract half object size for better fit
-                {
-                    RaycastHit hit;
-                    if (RaycastToTerrain(potentialPlacement + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-                    {
-                        potentialPlacement.y = hit.point.y;
-                    }
-                    else
-                    {
-                        continue;
-                    }
-
-                    Quaternion objectRotation = prefab.transform.rotation; // Keep default rotation for fill
-                    // If objectsRotatedRightOfLine, maybe orient fill objects to radial direction?
-                    // For now, keep it simple for fill:
-                    // if (objectsRotatedRightOfLine)
-                    // {
-                    //     Vector3 direction = (potentialPlacement - center).normalized;
-                    //     if (direction == Vector3.zero) direction = Vector3.forward;
-                    //     objectRotation = Quaternion.LookRotation(direction) * Quaternion.Euler(0, 90, 0);
-                    // }
-
-                    bool isValid = IsValidPlacement(potentialPlacement, boundsExtents, canOverlap, occupyGrid);
-
-                    GameObject preview = Instantiate(prefab, potentialPlacement, objectRotation);
-                    currentObjectPreviews.Add(preview);
-                    SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
-                }
-            }
-        }
-    }
-
-    // Catmull-Rom Spline Interpolation function
-    private Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
-    {
-        float t2 = t * t;
-        float t3 = t2 * t;
-
-        return 0.5f * (
-            (2f * p1) +
-            (-p0 + p2) * t +
-            (2f * p0 - 5f * p1 + 4f * p2 - p3) * t2 +
-            (-p0 + 3f * p1 - 3f * p2 + p3) * t3
-        );
-    }
-
-    // Generates a list of curved points from the original input points using Catmull-Rom
-    private List<Vector3> GetCurvedPoints(List<Vector3> inputPoints, int resolutionPerSegment)
-    {
-        List<Vector3> curvedPoints = new List<Vector3>();
-
-        if (inputPoints.Count < 2)
-        {
-            return new List<Vector3>(inputPoints);
-        }
-
-        List<Vector3> controlPoints = new List<Vector3>(inputPoints);
-        controlPoints.Insert(0, inputPoints[0]);
-        controlPoints.Add(inputPoints[inputPoints.Count - 1]);
-
-        for (int i = 0; i < controlPoints.Count - 3; i++)
-        {
-            Vector3 p0 = controlPoints[i];
-            Vector3 p1 = controlPoints[i + 1];
-            Vector3 p2 = controlPoints[i + 2];
-            Vector3 p3 = controlPoints[i + 3];
-
-            for (int j = 0; j <= resolutionPerSegment; j++)
-            {
-                float t = (float)j / resolutionPerSegment;
-                Vector3 interpolatedPoint = CatmullRom(p0, p1, p2, p3, t);
-
-                if (curvedPoints.Count == 0 || Vector3.Distance(curvedPoints.Last(), interpolatedPoint) > 0.0001f)
-                {
-                    curvedPoints.Add(interpolatedPoint);
-                }
+                placedObjects.Add(obj);
             }
         }
 
-        if (inputPoints.Count > 0 && (curvedPoints.Count == 0 || Vector3.Distance(curvedPoints.Last(), inputPoints.Last()) > 0.0001f))
+        if (_currentSelectedEntry.combineLineMeshes && placedObjects.Count > 0)
         {
-            curvedPoints.Add(inputPoints.Last());
+            CombineMeshes(placedObjects, _currentActiveLinePlacementPrefab.GetComponent<MeshRenderer>()?.sharedMaterial, "CombinedCircleLineMesh");
         }
 
-        return curvedPoints;
-    }
+        Debug.Log($"Circle perimeter placement complete. Placed {placedObjects.Count} objects.");
 
-    // Updates the visual object previews along the drawn curved line
-    private void UpdateLineObjectPreviews(bool isFinalPlacement)
-    {
-        ClearObjectPreviews();
-
-        if (_currentSelectedEntry == null || !_currentSelectedEntry.showGhost || _currentActiveGhostPrefab == null || linePoints.Count < 1) return;
-
-        List<Vector3> pointsForCurveGeneration = new List<Vector3>(linePoints);
-        if (!isFinalPlacement && _mouseWorldPositionFound && linePoints.Count > 0)
+        if (!_currentSelectedEntry.isContinuous)
         {
-            pointsForCurveGeneration.Add(_mouseWorldPosition);
-        }
-
-        // Add the closing segment for LineLoop previews
-        if ((_currentActiveMode == ActivePlacementMode.LineLoop || _currentActiveMode == ActivePlacementMode.LineLoopFill) && linePoints.Count >= 2)
-        {
-            pointsForCurveGeneration.Add(linePoints[0]); // Add the first point to close the loop for preview
-        }
-
-
-        List<Vector3> curvedPath = GetCurvedPoints(pointsForCurveGeneration, curveResolution);
-
-        if (curvedPath.Count < 2) return;
-
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-        float effectiveObjectSize = objectLength + objectSpacing;
-
-        float currentPathDistance = 0f;
-        float nextObjectDistanceTarget = effectiveObjectSize / 2f;
-
-        for (int i = 0; i < curvedPath.Count - 1; i++)
-        {
-            Vector3 currentPoint = curvedPath[i];
-            Vector3 nextPoint = curvedPath[i + 1];
-            float segmentLength = Vector3.Distance(currentPoint, nextPoint);
-
-            while (currentPathDistance + segmentLength >= nextObjectDistanceTarget)
-            {
-                float distanceIntoSegment = nextObjectDistanceTarget - currentPathDistance;
-                Vector3 previewPosition = Vector3.Lerp(currentPoint, nextPoint, distanceIntoSegment / segmentLength);
-
-                Vector3 direction = (nextPoint - currentPoint).normalized;
-                if (direction == Vector3.zero && i > 0)
-                {
-                    direction = (currentPoint - curvedPath[i - 1]).normalized;
-                }
-                if (direction == Vector3.zero) direction = Vector3.forward;
-
-                RaycastHit hit;
-                if (RaycastToTerrain(previewPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-                {
-                    previewPosition = hit.point;
-                }
-                else
-                {
-                    nextObjectDistanceTarget += effectiveObjectSize;
-                    continue;
-                }
-
-                Quaternion objectRotation = Quaternion.LookRotation(direction);
-
-                if (objectsRotatedRightOfLine)
-                {
-                    objectRotation *= Quaternion.Euler(0, 90, 0);
-                    Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
-                    previewPosition += perpendicularOffset;
-                }
-
-                bool isValid = IsValidPlacement(previewPosition, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-
-                GameObject preview = Instantiate(_currentActiveGhostPrefab, previewPosition, objectRotation);
-                currentObjectPreviews.Add(preview);
-
-                SetPreviewMaterial(preview, isValid ? validPlacementMaterial : invalidPlacementMaterial);
-
-                nextObjectDistanceTarget += effectiveObjectSize;
-            }
-            currentPathDistance += segmentLength;
-        }
-
-        // If LineLoopFill, also show a preview of the fill. This is a simplified approach,
-        // a true polygon fill preview is more complex and might involve triangulation.
-        if (_currentActiveMode == ActivePlacementMode.LineLoopFill && linePoints.Count >= 3)
-        {
-            // For a basic visual cue, we can try to place one ghost object at the center of the loop.
-            // A more robust solution would involve triangulating the polygon and filling it with ghosts.
-            Vector3 centroid = Vector3.zero;
-            foreach(Vector3 p in linePoints)
-            {
-                centroid += p;
-            }
-            centroid /= linePoints.Count;
-
-            RaycastHit hit;
-            if (RaycastToTerrain(centroid + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-            {
-                centroid.y = hit.point.y;
-            }
-
-            // This single central ghost is just a very basic visual indicator for fill.
-            if (_currentActiveGhostPrefab != null)
-            {
-                GameObject fillPreview = Instantiate(_currentActiveGhostPrefab, centroid, Quaternion.identity);
-                currentObjectPreviews.Add(fillPreview);
-                SetPreviewMaterial(fillPreview, validPlacementMaterial); // Assume valid for preview
-            }
-        }
-    }
-
-    private void ClearObjectPreviews()
-    {
-        foreach (GameObject preview in currentObjectPreviews)
-        {
-            if (preview != null)
-            {
-                Destroy(preview);
-            }
-        }
-        currentObjectPreviews.Clear();
-    }
-
-    private bool RaycastToTerrain(Vector3 origin, out RaycastHit hit, LayerMask layerMask)
-    {
-        return Physics.Raycast(origin, Vector3.down, out hit, Mathf.Infinity, layerMask);
-    }
-
-    private void SetPreviewMaterial(GameObject obj, Material material)
-    {
-        Renderer[] renderers = obj.GetComponentsInChildren<Renderer>();
-        foreach (Renderer r in renderers)
-        {
-            r.material = material;
-        }
-    }
-
-    // Check if a placement position is valid based on overlap and grid rules
-    private bool IsValidPlacement(Vector3 position, Vector3 boundsExtents, bool canOverlap, bool occupyGrid)
-    {
-        // Assuming 'position' is the desired placement point (e.g., bottom-center).
-        // Adjust boundsCenter to be the actual center of the object's volume based on its extents.
-        Vector3 boundsCenter = position + new Vector3(0, boundsExtents.y, 0);
-
-        if (!canOverlap)
-        {
-            // Check for overlaps with existing colliders
-            Collider[] colliders = Physics.OverlapBox(boundsCenter, boundsExtents, Quaternion.identity, overlapCheckLayerMask);
-            // If any colliders are found, it's invalid unless it's just the terrain itself
-            if (colliders.Any(c => !c.gameObject.Equals(gameObject) && ((1 << c.gameObject.layer) & placementLayerMask) == 0))
-            {
-                return false;
-            }
-        }
-
-        if (occupyGrid)
-        {
-            // Check if any grid cells occupied by this object are already taken
-            // This is a simplified approach, could be improved for large objects
-            Vector2Int gridPos = WorldToGrid(position);
-            if (_occupiedGridCells.Contains(gridPos))
-            {
-                return false;
-            }
-            // For objects larger than a single grid cell, you'd need to iterate over all
-            // grid cells covered by the object's bounds.
-            // int startX = Mathf.FloorToInt((boundsCenter.x - boundsExtents.x) / gridSize);
-            // int endX = Mathf.FloorToInt((boundsCenter.x + boundsExtents.x) / gridSize);
-            // int startZ = Mathf.FloorToInt((boundsCenter.z - boundsExtents.z) / gridSize);
-            // int endZ = Mathf.FloorToInt((boundsCenter.z + boundsExtents.z) / gridSize);
-            // for (int x = startX; x <= endX; x++) {
-            //     for (int z = startZ; z <= endZ; z++) {
-            //         if (_occupiedGridCells.Contains(new Vector2Int(x, z))) return false;
-            //     }
-            // }
-        }
-
-        return true;
-    }
-
-    // Helper to convert world position to grid coordinates (flat 2D grid)
-    private Vector2Int WorldToGrid(Vector3 worldPos)
-    {
-        return new Vector2Int(
-            Mathf.FloorToInt(worldPos.x / gridSize),
-            Mathf.FloorToInt(worldPos.z / gridSize)
-        );
-    }
-
-    // Helper to mark grid cells as occupied (simplified for single cell)
-    private void MarkGridOccupied(Vector3 worldPos, bool occupied)
-    {
-        if (_currentSelectedEntry == null || !_currentSelectedEntry.occupyGrid) return;
-
-        Vector2Int gridPos = WorldToGrid(worldPos);
-        if (occupied)
-        {
-            _occupiedGridCells.Add(gridPos);
+            ExitPlacementMode();
         }
         else
         {
-            _occupiedGridCells.Remove(gridPos);
-        }
-        // More complex logic needed here for multi-cell objects
-    }
-
-
-    private void PlaceAllObjectsFromLine()
-    {
-        if (_currentActivePlacementPrefab == null || _currentActiveMode != ActivePlacementMode.Line || _currentSelectedEntry == null)
-        {
-            Debug.LogWarning("No line object prefab selected or not in line placement mode.");
-            ExitPlacementMode();
-            return;
-        }
-
-        int placedCount = 0;
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-
-        foreach (GameObject preview in currentObjectPreviews)
-        {
-            bool isValid = IsValidPlacement(preview.transform.position, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-            if (isValid)
-            {
-                Instantiate(_currentActivePlacementPrefab, preview.transform.position, preview.transform.rotation);
-                MarkGridOccupied(preview.transform.position, true); // Mark grid cell occupied
-                placedCount++;
-            }
-            else
-            {
-                Debug.LogWarning($"Skipped placing an object at {preview.transform.position} due to invalid placement rules.");
-            }
-        }
-        Debug.Log($"Line placement finished! Placed {placedCount} {_currentSelectedEntry.buildingInfo.buildingName}(s).");
-
-        if (_currentSelectedEntry.isContinuous)
-        {
-            currentState = LinePlacementState.Idle; // Reset to idle for next drawing
-            linePoints.Clear();
-            DisableVisualAids();
-            Debug.Log("Continuous line placement. Ready for next line.");
-        }
-        else
-        {
-            ExitPlacementMode();
-        }
-    }
-
-    // Place objects for Line Loop mode
-    private void PlaceAllObjectsFromLineLoop()
-    {
-        if (_currentActivePlacementPrefab == null || _currentActiveMode != ActivePlacementMode.LineLoop || _currentSelectedEntry == null)
-        {
-            Debug.LogWarning("No line loop object prefab selected or not in line loop placement mode.");
-            ExitPlacementMode();
-            return;
-        }
-
-        if (linePoints.Count < 3)
-        {
-            Debug.LogWarning("Not enough points to form a meaningful loop. Need at least 3 points.");
-            ExitPlacementMode();
-            return;
-        }
-
-        int placedCount = 0;
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-
-        // Generate the final list of points including the closing segment
-        List<Vector3> pointsForFinalPlacement = new List<Vector3>(linePoints);
-        pointsForFinalPlacement.Add(linePoints[0]); // Add the first point to close the loop
-
-        List<Vector3> curvedPath = GetCurvedPoints(pointsForFinalPlacement, curveResolution);
-
-        if (curvedPath.Count < 2)
-        {
-            Debug.LogWarning("Failed to generate a curved path for line loop placement.");
-            ExitPlacementMode();
-            return;
-        }
-
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-        float effectiveObjectSize = objectLength + objectSpacing;
-
-        float currentPathDistance = 0f;
-        float nextObjectDistanceTarget = effectiveObjectSize / 2f;
-
-        for (int i = 0; i < curvedPath.Count - 1; i++)
-        {
-            Vector3 currentPoint = curvedPath[i];
-            Vector3 nextPoint = curvedPath[i + 1];
-            float segmentLength = Vector3.Distance(currentPoint, nextPoint);
-
-            while (currentPathDistance + segmentLength >= nextObjectDistanceTarget)
-            {
-                float distanceIntoSegment = nextObjectDistanceTarget - currentPathDistance;
-                Vector3 placementPosition = Vector3.Lerp(currentPoint, nextPoint, distanceIntoSegment / segmentLength);
-
-                Vector3 direction = (nextPoint - currentPoint).normalized;
-                if (direction == Vector3.zero && i > 0)
-                {
-                    direction = (currentPoint - curvedPath[i - 1]).normalized;
-                }
-                if (direction == Vector3.zero) direction = Vector3.forward;
-
-                RaycastHit hit;
-                if (RaycastToTerrain(placementPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-                {
-                    placementPosition = hit.point;
-                }
-                else
-                {
-                    nextObjectDistanceTarget += effectiveObjectSize;
-                    continue;
-                }
-
-                Quaternion objectRotation = Quaternion.LookRotation(direction);
-
-                if (objectsRotatedRightOfLine)
-                {
-                    objectRotation *= Quaternion.Euler(0, 90, 0);
-                    Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
-                    placementPosition += perpendicularOffset;
-                }
-
-                bool isValid = IsValidPlacement(placementPosition, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-                if (isValid)
-                {
-                    Instantiate(_currentActivePlacementPrefab, placementPosition, objectRotation);
-                    MarkGridOccupied(placementPosition, true);
-                    placedCount++;
-                }
-                else
-                {
-                    Debug.LogWarning($"Skipped placing Line Loop object at {placementPosition} due to invalid placement rules.");
-                }
-                nextObjectDistanceTarget += effectiveObjectSize;
-            }
-            currentPathDistance += segmentLength;
-        }
-
-        Debug.Log($"Line Loop placement finished! Placed {placedCount} {_currentSelectedEntry.buildingInfo.buildingName}(s).");
-
-        if (_currentSelectedEntry.isContinuous)
-        {
-            currentState = LinePlacementState.Idle; // Reset to idle for next drawing
-            linePoints.Clear();
-            DisableVisualAids();
-            Debug.Log("Continuous line loop placement. Ready for next loop.");
-        }
-        else
-        {
-            ExitPlacementMode();
-        }
-    }
-
-    // Place objects for Line Loop Fill mode
-    private void PlaceAllObjectsFromLineLoopFill()
-    {
-        if (_currentActivePlacementPrefab == null || _currentActiveMode != ActivePlacementMode.LineLoopFill || _currentSelectedEntry == null)
-        {
-            Debug.LogWarning("No line loop fill object prefab selected or not in line loop fill placement mode.");
-            ExitPlacementMode();
-            return;
-        }
-
-        if (linePoints.Count < 3)
-        {
-            Debug.LogWarning("Not enough points to form a meaningful loop for filling. Need at least 3 points.");
-            ExitPlacementMode();
-            return;
-        }
-
-        int placedCount = 0;
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-
-        // First, place objects along the perimeter (line loop behavior)
-        List<Vector3> pointsForPerimeter = new List<Vector3>(linePoints);
-        pointsForPerimeter.Add(linePoints[0]); // Close the loop for perimeter placement
-        List<Vector3> curvedPerimeterPath = GetCurvedPoints(pointsForPerimeter, curveResolution);
-
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-        float effectiveObjectSize = objectLength + objectSpacing;
-
-        float currentPathDistance = 0f;
-        float nextObjectDistanceTarget = effectiveObjectSize / 2f;
-
-        for (int i = 0; i < curvedPerimeterPath.Count - 1; i++)
-        {
-            Vector3 currentPoint = curvedPerimeterPath[i];
-            Vector3 nextPoint = curvedPerimeterPath[i + 1];
-            float segmentLength = Vector3.Distance(currentPoint, nextPoint);
-
-            while (currentPathDistance + segmentLength >= nextObjectDistanceTarget)
-            {
-                float distanceIntoSegment = nextObjectDistanceTarget - currentPathDistance;
-                Vector3 placementPosition = Vector3.Lerp(currentPoint, nextPoint, distanceIntoSegment / segmentLength);
-
-                Vector3 direction = (nextPoint - currentPoint).normalized;
-                if (direction == Vector3.zero && i > 0)
-                {
-                    direction = (currentPoint - curvedPerimeterPath[i - 1]).normalized;
-                }
-                if (direction == Vector3.zero) direction = Vector3.forward;
-
-                RaycastHit hit;
-                if (RaycastToTerrain(placementPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-                {
-                    placementPosition = hit.point;
-                }
-                else
-                {
-                    nextObjectDistanceTarget += effectiveObjectSize;
-                    continue;
-                }
-
-                Quaternion objectRotation = Quaternion.LookRotation(direction);
-
-                if (objectsRotatedRightOfLine)
-                {
-                    objectRotation *= Quaternion.Euler(0, 90, 0);
-                    Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
-                    placementPosition += perpendicularOffset;
-                }
-
-                bool isValid = IsValidPlacement(placementPosition, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-                if (isValid)
-                {
-                    Instantiate(_currentActivePlacementPrefab, placementPosition, objectRotation);
-                    MarkGridOccupied(placementPosition, true);
-                    placedCount++;
-                }
-                else
-                {
-                    Debug.LogWarning($"Skipped placing Line Loop Fill (perimeter) object at {placementPosition} due to invalid placement rules.");
-                }
-                nextObjectDistanceTarget += effectiveObjectSize;
-            }
-            currentPathDistance += segmentLength;
-        }
-
-        // Second, fill the interior of the polygon
-        // This is a simplified approach using a bounding box and checking points.
-        // For complex concave polygons, a more robust point-in-polygon algorithm
-        // or a triangulation-based filling would be necessary.
-        Vector3 minX = linePoints.OrderBy(p => p.x).First();
-        Vector3 maxX = linePoints.OrderByDescending(p => p.x).First();
-        Vector3 minZ = linePoints.OrderBy(p => p.z).First();
-        Vector3 maxZ = linePoints.OrderByDescending(p => p.z).First();
-
-        Vector3 minBounds = new Vector3(minX.x, 0, minZ.z);
-        Vector3 maxBounds = new Vector3(maxX.x, 0, maxZ.z);
-
-        float fillObjectSizeZ = objectLength + fillObjectSpacing;
-        float fillObjectSizeX = objectWidth + fillObjectSpacing;
-
-        // Simplified: Iterate through a grid within the bounding box
-        for (float x = minBounds.x; x < maxBounds.x; x += fillObjectSizeX)
-        {
-            for (float z = minBounds.z; z < maxBounds.z; z += fillObjectSizeZ)
-            {
-                Vector3 potentialPlacement = new Vector3(x + fillObjectSizeX / 2f, 0, z + fillObjectSizeZ / 2f);
-
-                // Simple point-in-polygon check for convex shapes.
-                // For a more general solution, a ray-casting algorithm or ear-clipping triangulation is needed.
-                // This `IsPointInPolygon` is a placeholder. For actual use, implement a robust one.
-                if (IsPointInConvexPolygon(potentialPlacement, linePoints))
-                {
-                    RaycastHit hit;
-                    if (RaycastToTerrain(potentialPlacement + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-                    {
-                        potentialPlacement.y = hit.point.y;
-                    }
-                    else
-                    {
-                        continue;
-                    }
-
-                    bool isValid = IsValidPlacement(potentialPlacement, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-                    if (isValid)
-                    {
-                        Instantiate(_currentActivePlacementPrefab, potentialPlacement, Quaternion.identity); // No specific rotation for fill
-                        MarkGridOccupied(potentialPlacement, true);
-                        placedCount++;
-                    }
-                    else
-                    {
-                        Debug.LogWarning($"Skipped placing Line Loop Fill (interior) object at {potentialPlacement} due to invalid placement rules.");
-                    }
-                }
-            }
-        }
-
-
-        Debug.Log($"Line Loop Fill placement finished! Placed {placedCount} {_currentSelectedEntry.buildingInfo.buildingName}(s).");
-
-        if (_currentSelectedEntry.isContinuous)
-        {
-            currentState = LinePlacementState.Idle; // Reset to idle for next drawing
-            linePoints.Clear();
-            DisableVisualAids();
-            Debug.Log("Continuous line loop fill placement. Ready for next loop.");
-        }
-        else
-        {
-            ExitPlacementMode();
-        }
-    }
-
-    // Placeholder for a simple (and likely insufficient for complex polygons) point-in-polygon check
-    // This typically works for convex polygons or very simple concave ones.
-    // A robust solution would involve ray casting or winding number algorithms.
-    private bool IsPointInConvexPolygon(Vector3 point, List<Vector3> polygonPoints)
-    {
-        if (polygonPoints.Count < 3) return false;
-
-        bool inside = false;
-        for (int i = 0, j = polygonPoints.Count - 1; i < polygonPoints.Count; j = i++)
-        {
-            Vector3 pI = polygonPoints[i];
-            Vector3 pJ = polygonPoints[j];
-
-            // Ignore Y for 2D polygon check
-            if (((pI.z <= point.z && point.z < pJ.z) || (pJ.z <= point.z && point.z < pI.z)) &&
-                (point.x < (pJ.x - pI.x) * (point.z - pI.z) / (pJ.z - pI.z) + pI.x))
-            {
-                inside = !inside;
-            }
-        }
-        return inside;
-    }
-
-
-    // Place objects in a circle
-    private void PlaceObjectsInCircle()
-    {
-        if (_currentActivePlacementPrefab == null || _currentActiveMode != ActivePlacementMode.LineCircle || _currentSelectedEntry == null)
-        {
-            Debug.LogWarning("No circle object prefab selected or not in circle placement mode.");
-            ExitPlacementMode();
-            return;
-        }
-
-        if (_circleRadius <= 0)
-        {
-            Debug.LogWarning("Circle radius is zero or negative. Cannot place objects.");
-            ExitPlacementMode();
-            return;
-        }
-
-        int placedCount = 0;
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-        float effectiveObjectSize = objectLength + objectSpacing;
-
-        float circumference = 2 * Mathf.PI * _circleRadius;
-        int numberOfObjects = Mathf.FloorToInt(circumference / effectiveObjectSize);
-
-        if (numberOfObjects == 0)
-        {
-            Debug.LogWarning("No objects can fit on the circle circumference with current spacing.");
-            ExitPlacementMode();
-            return;
-        }
-
-        float angleStep = 360f / numberOfObjects;
-
-        for (int i = 0; i < numberOfObjects; i++)
-        {
-            float angle = i * angleStep;
-            Vector3 placementPosition = _circleCenter + new Vector3(Mathf.Cos(Mathf.Deg2Rad * angle), 0, Mathf.Sin(Mathf.Deg2Rad * angle)) * _circleRadius;
-
-            RaycastHit hit;
-            if (RaycastToTerrain(placementPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-            {
-                placementPosition.y = hit.point.y;
-            }
-            else
-            {
-                continue;
-            }
-
-            Vector3 direction = (placementPosition - _circleCenter).normalized; // Direction from center to object
-            Quaternion objectRotation = Quaternion.LookRotation(direction);
-
-            if (objectsRotatedRightOfLine)
-            {
-                objectRotation *= Quaternion.Euler(0, 90, 0); // Rotate 90 degrees relative to the radial direction
-                Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
-                placementPosition += perpendicularOffset;
-            }
-
-            bool isValid = IsValidPlacement(placementPosition, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-            if (isValid)
-            {
-                Instantiate(_currentActivePlacementPrefab, placementPosition, objectRotation);
-                MarkGridOccupied(placementPosition, true);
-                placedCount++;
-            }
-            else
-            {
-                Debug.LogWarning($"Skipped placing Circle object at {placementPosition} due to invalid placement rules.");
-            }
-        }
-
-        Debug.Log($"Circle placement finished! Placed {placedCount} {_currentSelectedEntry.buildingInfo.buildingName}(s).");
-
-        if (_currentSelectedEntry.isContinuous)
-        {
-            currentState = LinePlacementState.Idle; // Reset to idle for next drawing
+            currentState = LinePlacementState.Idle;
             _isDrawingCircle = false;
             _circleRadius = 0;
-            DisableVisualAids();
-            Debug.Log("Continuous circle placement. Ready for next circle.");
-        }
-        else
-        {
-            ExitPlacementMode();
+            ClearObjectPreviews();
         }
     }
 
-    // NEW: Place objects in a circle with fill
+
+    // New: Places objects along the line and fills the area of a circle
     private void PlaceAllObjectsFromLineCircleFill()
     {
-        if (_currentActivePlacementPrefab == null || _currentActiveMode != ActivePlacementMode.LineCircleFill || _currentSelectedEntry == null)
+        if (_currentActiveLinePlacementPrefab == null || _currentActiveFillPlacementPrefab == null)
         {
-            Debug.LogWarning("No circle fill object prefab selected or not in circle fill placement mode.");
+            Debug.LogError("Line Circle Fill Placement requires both Line and Fill prefabs to be assigned.");
+            ExitPlacementMode();
+            return;
+        }
+        if (_circleRadius < minBoxSize)
+        {
+            Debug.LogWarning($"Circle radius too small. Minimum radius: {minBoxSize}. Current: {_circleRadius:F2}.");
             ExitPlacementMode();
             return;
         }
 
-        if (_circleRadius <= 0)
+        // 1. Place objects along the circle perimeter
+        PlaceObjectsInCircle(); // This will handle combining line meshes if configured
+
+        // 2. Place objects to fill the interior
+        List<GameObject> fillObjects = new List<GameObject>();
+        Vector3 fillBoundsExtents = _currentSelectedEntry.fillBuildingInfo.buildingBoundsExtents;
+        float objectWidth = fillBoundsExtents.x * 2;
+        float objectLength = fillBoundsExtents.z * 2;
+        float step = Mathf.Min(objectWidth, objectLength) + fillObjectSpacing;
+
+        if (step <= 0)
         {
-            Debug.LogWarning("Circle radius is zero or negative. Cannot place objects for fill.");
+            Debug.LogError("Invalid object size or spacing for circle fill. Cannot place objects.");
             ExitPlacementMode();
             return;
         }
 
-        int placedCount = 0;
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-
-        // First, place objects along the perimeter (similar to PlaceObjectsInCircle)
-        float effectiveObjectSizePerimeter = objectLength + objectSpacing;
-        float circumference = 2 * Mathf.PI * _circleRadius;
-        int numberOfObjectsPerimeter = Mathf.FloorToInt(circumference / effectiveObjectSizePerimeter);
-
-        if (numberOfObjectsPerimeter > 0)
+        // Iterate in a square grid within the circle's bounding box
+        for (float x = _circleCenter.x - _circleRadius; x <= _circleCenter.x + _circleRadius; x += step)
         {
-            float angleStep = 360f / numberOfObjectsPerimeter;
-            for (int i = 0; i < numberOfObjectsPerimeter; i++)
+            for (float z = _circleCenter.z - _circleRadius; z <= _circleCenter.z + _circleRadius; z += step)
             {
-                float angle = i * angleStep;
-                Vector3 placementPosition = _circleCenter + new Vector3(Mathf.Cos(Mathf.Deg2Rad * angle), 0, Mathf.Sin(Mathf.Deg2Rad * angle)) * _circleRadius;
+                Vector3 position = new Vector3(x, _circleCenter.y, z);
 
-                RaycastHit hit;
-                if (RaycastToTerrain(placementPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
-                {
-                    placementPosition.y = hit.point.y;
-                }
-                else
-                {
-                    continue;
-                }
-
-                Vector3 direction = (placementPosition - _circleCenter).normalized;
-                Quaternion objectRotation = Quaternion.LookRotation(direction);
-
-                if (objectsRotatedRightOfLine)
-                {
-                    objectRotation *= Quaternion.Euler(0, 90, 0);
-                    Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
-                    placementPosition += perpendicularOffset;
-                }
-
-                bool isValid = IsValidPlacement(placementPosition, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-                if (isValid)
-                {
-                    Instantiate(_currentActivePlacementPrefab, placementPosition, objectRotation);
-                    MarkGridOccupied(placementPosition, true);
-                    placedCount++;
-                }
-                else
-                {
-                    Debug.LogWarning($"Skipped placing Line Circle Fill (perimeter) object at {placementPosition} due to invalid placement rules.");
-                }
-            }
-        }
-
-        // Second, fill the interior of the circle
-        float effectiveObjectSizeFillZ = objectLength + fillObjectSpacing;
-        float effectiveObjectSizeFillX = objectWidth + fillObjectSpacing;
-
-        for (float x = _circleCenter.x - _circleRadius; x <= _circleCenter.x + _circleRadius; x += effectiveObjectSizeFillX)
-        {
-            for (float z = _circleCenter.z - _circleRadius; z <= _circleCenter.z + _circleRadius; z += effectiveObjectSizeFillZ)
-            {
-                Vector3 potentialPlacement = new Vector3(x + effectiveObjectSizeFillX / 2f, _circleCenter.y, z + effectiveObjectSizeFillZ / 2f);
-
-                // Check if the potential placement is within the circle's radius
-                if (Vector3.Distance(_circleCenter, potentialPlacement) <= _circleRadius - (effectiveObjectSizeFillX / 2f)) // Subtract half object size for better fit
+                // Check if the current position is within the circle
+                if (Vector3.Distance(_circleCenter, new Vector3(position.x, _circleCenter.y, position.z)) <= _circleRadius)
                 {
                     RaycastHit hit;
-                    if (RaycastToTerrain(potentialPlacement + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                    if (RaycastToTerrain(position + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
                     {
-                        potentialPlacement.y = hit.point.y;
+                        position.y = hit.point.y;
                     }
                     else
                     {
                         continue;
                     }
 
-                    Quaternion objectRotation = _currentActivePlacementPrefab.transform.rotation; // Keep default rotation for fill
-                    // If objectsRotatedRightOfLine, maybe orient fill objects to radial direction?
-                    // For now, keep it simple for fill:
-                    // if (objectsRotatedRightOfLine)
-                    // {
-                    //     Vector3 direction = (potentialPlacement - _circleCenter).normalized;
-                    //     if (direction == Vector3.zero) direction = Vector3.forward;
-                    //     objectRotation = Quaternion.LookRotation(direction) * Quaternion.Euler(0, 90, 0);
-                    // }
-
-                    bool isValid = IsValidPlacement(potentialPlacement, boundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-                    if (isValid)
+                    if (IsValidPlacement(position, fillBoundsExtents, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid))
                     {
-                        Instantiate(_currentActivePlacementPrefab, potentialPlacement, objectRotation);
-                        MarkGridOccupied(potentialPlacement, true);
-                        placedCount++;
-                    }
-                    else
-                    {
-                        Debug.LogWarning($"Skipped placing Line Circle Fill (interior) object at {potentialPlacement} due to invalid placement rules.");
+                        GameObject obj = Instantiate(_currentActiveFillPlacementPrefab, position, Quaternion.identity, _currentPlacementParent.transform);
+                        if (_currentSelectedEntry.occupyGrid)
+                        {
+                            MarkGridCellsOccupied(position, fillBoundsExtents);
+                        }
+                        fillObjects.Add(obj);
                     }
                 }
             }
         }
 
-        Debug.Log($"Line Circle Fill placement finished! Placed {placedCount} {_currentSelectedEntry.buildingInfo.buildingName}(s).");
+        if (_currentSelectedEntry.combineFillMeshes && fillObjects.Count > 0)
+        {
+            CombineMeshes(fillObjects, _currentActiveFillPlacementPrefab.GetComponent<MeshRenderer>()?.sharedMaterial, "CombinedCircleFillMesh");
+        }
 
-        if (_currentSelectedEntry.isContinuous)
+        Debug.Log($"Circle Fill placement complete. Placed {fillObjects.Count} fill objects.");
+
+        if (!_currentSelectedEntry.isContinuous)
+        {
+            ExitPlacementMode();
+        }
+        else
         {
             currentState = LinePlacementState.Idle;
             _isDrawingCircle = false;
             _circleRadius = 0;
-            DisableVisualAids();
-            Debug.Log("Continuous line circle fill placement. Ready for next circle.");
-        }
-        else
-        {
-            ExitPlacementMode();
+            ClearObjectPreviews();
         }
     }
 
 
-    // Refactored from PlaceObjectsInBox to handle original combined Box mode
-    private void PlaceAllObjectsFromCombinedBox(Vector3 minCorner, Vector3 maxCorner)
+    // New: Generic function to place objects along a path (used by lines, loops, box lines, etc.)
+    private void PlaceObjectsAlongPath(List<Vector3> pathPoints, GameObject objectPrefab, Vector3 boundsExtents, float spacing,
+                                       bool canOverlap, bool occupyGrid, bool rotatedRightOfLine, int curveResolution, List<GameObject> placedObjects)
     {
-        if (_currentActivePlacementPrefab == null || _currentSelectedEntry == null)
+        if (pathPoints.Count < 2 || objectPrefab == null) return;
+
+        List<Vector3> interpolatedPoints = new List<Vector3>();
+
+        for (int i = 0; i < pathPoints.Count - 1; i++)
         {
-            Debug.LogWarning("No object prefab selected for combined box placement.");
-            ExitPlacementMode();
-            return;
+            Vector3 p0 = i == 0 ? pathPoints[0] : pathPoints[i - 1]; // Use first point twice if at start
+            Vector3 p1 = pathPoints[i];
+            Vector3 p2 = pathPoints[i + 1];
+            Vector3 p3 = (i + 2 >= pathPoints.Count) ? pathPoints[pathPoints.Count - 1] : pathPoints[i + 2]; // Use last point twice if at end
+
+            for (int j = 0; j <= curveResolution; j++)
+            {
+                float t = (float)j / curveResolution;
+                Vector3 interpolatedPoint = GetCatmullRomPosition(t, p0, p1, p2, p3);
+
+                RaycastHit hit;
+                if (RaycastToTerrain(interpolatedPoint + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                {
+                    interpolatedPoint.y = hit.point.y;
+                }
+                interpolatedPoints.Add(interpolatedPoint);
+            }
         }
 
-        ClearObjectPreviews(); // Clear any existing previews
-
-        int placedCount = 0;
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-
-        placedCount += FinalizeBoxLinePlacement(minCorner, maxCorner, _currentActivePlacementPrefab, boundsExtents, objectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-        placedCount += FinalizeBoxFillPlacement(minCorner, maxCorner, _currentActivePlacementPrefab, boundsExtents, fillObjectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-
-        if (placedCount > 0)
-        {
-            Debug.Log($"Combined Box placement finished! Placed {placedCount} objects of type {_currentSelectedEntry.buildingInfo.buildingName}.");
-        }
-        else
-        {
-            Debug.LogWarning("Combined Box placement finished, but no objects were placed. Check object prefabs and placement settings.");
-        }
-
-        if (_currentSelectedEntry.isContinuous)
-        {
-            currentState = LinePlacementState.Idle; // Reset to idle for next drawing
-            _isDraggingBox = false;
-            DisableVisualAids();
-            Debug.Log("Continuous combined box placement. Ready for next box.");
-        }
-        else
-        {
-            ExitPlacementMode();
-        }
-    }
-
-    // Place objects only for Box Line mode
-    private void PlaceAllObjectsFromBoxLine(Vector3 minCorner, Vector3 maxCorner)
-    {
-        if (_currentActivePlacementPrefab == null || _currentSelectedEntry == null)
-        {
-            Debug.LogWarning("No object prefab selected for box line placement.");
-            ExitPlacementMode();
-            return;
-        }
-
-        ClearObjectPreviews();
-
-        int placedCount = 0;
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-
-        placedCount += FinalizeBoxLinePlacement(minCorner, maxCorner, _currentActivePlacementPrefab, boundsExtents, objectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-
-        if (placedCount > 0)
-        {
-            Debug.Log($"Box Line placement finished! Placed {placedCount} objects of type {_currentSelectedEntry.buildingInfo.buildingName}.");
-        }
-        else
-        {
-            Debug.LogWarning("Box Line placement finished, but no objects were placed. Check object prefabs and placement settings.");
-        }
-
-        if (_currentSelectedEntry.isContinuous)
-        {
-            currentState = LinePlacementState.Idle;
-            _isDraggingBox = false;
-            DisableVisualAids();
-            Debug.Log("Continuous box line placement. Ready for next box.");
-        }
-        else
-        {
-            ExitPlacementMode();
-        }
-    }
-
-    // Place objects only for Box Fill mode
-    private void PlaceAllObjectsFromBoxFill(Vector3 minCorner, Vector3 maxCorner)
-    {
-        if (_currentActivePlacementPrefab == null || _currentSelectedEntry == null)
-        {
-            Debug.LogWarning("No object prefab selected for box fill placement.");
-            ExitPlacementMode();
-            return;
-        }
-
-        ClearObjectPreviews();
-
-        int placedCount = 0;
-        Vector3 boundsExtents = _currentSelectedEntry.buildingInfo.buildingBoundsExtents;
-
-        placedCount += FinalizeBoxFillPlacement(minCorner, maxCorner, _currentActivePlacementPrefab, boundsExtents, fillObjectSpacing, _currentSelectedEntry.canOverlap, _currentSelectedEntry.occupyGrid);
-
-        if (placedCount > 0)
-        {
-            Debug.Log($"Box Fill placement finished! Placed {placedCount} objects of type {_currentSelectedEntry.buildingInfo.buildingName}.");
-        }
-        else
-        {
-            Debug.LogWarning("Box Fill placement finished, but no objects were placed. Check object prefabs and placement settings.");
-        }
-
-        if (_currentSelectedEntry.isContinuous)
-        {
-            currentState = LinePlacementState.Idle;
-            _isDraggingBox = false;
-            DisableVisualAids();
-            Debug.Log("Continuous box fill placement. Ready for next box.");
-        }
-        else
-        {
-            ExitPlacementMode();
-        }
-    }
-
-
-    // Helper to finalize placement along a box's perimeter
-    private int FinalizeBoxLinePlacement(Vector3 minCorner, Vector3 maxCorner, GameObject prefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
-    {
-        if (prefab == null) return 0;
-
-        int count = 0;
         float objectLength = boundsExtents.z * 2;
         float objectWidth = boundsExtents.x * 2;
         float effectiveObjectSize = objectLength + spacing;
+        float currentDistance = 0f;
+        Vector3 previousPoint = interpolatedPoints[0];
 
-        List<Vector3> boxCorners = new List<Vector3>()
+        // Ensure the first object is placed
+        Vector3 initialDirection = (interpolatedPoints[1] - interpolatedPoints[0]).normalized;
+        Quaternion initialRotation = Quaternion.LookRotation(initialDirection);
+        Vector3 initialPos = interpolatedPoints[0];
+
+        if (rotatedRightOfLine)
         {
-            new Vector3(minCorner.x, 0, minCorner.z),
-            new Vector3(maxCorner.x, 0, minCorner.z),
-            new Vector3(maxCorner.x, 0, maxCorner.z),
-            new Vector3(minCorner.x, 0, maxCorner.z),
-            new Vector3(minCorner.x, 0, minCorner.z)
-        };
+            initialRotation *= Quaternion.Euler(0, 90, 0);
+            Vector3 perpendicularOffset = initialRotation * Vector3.forward * (objectWidth / 2f);
+            initialPos += perpendicularOffset;
+        }
 
-        float currentPathDistance = 0f;
-        float nextObjectDistanceTarget = effectiveObjectSize / 2f;
-
-        for (int i = 0; i < boxCorners.Count - 1; i++)
+        if (interpolatedPoints.Count > 1 && IsValidPlacement(initialPos, boundsExtents, canOverlap, occupyGrid))
         {
-            Vector3 currentSegmentStart = boxCorners[i];
-            Vector3 currentSegmentEnd = boxCorners[i + 1];
-            float segmentLength = Vector3.Distance(currentSegmentStart, currentSegmentEnd);
-
-            if (segmentLength < 0.001f) continue;
-
-            RaycastHit hitStart, hitEnd;
-            if (RaycastToTerrain(currentSegmentStart + Vector3.up * terrainRaycastStartHeight, out hitStart, placementLayerMask))
-                currentSegmentStart.y = hitStart.point.y;
-            if (RaycastToTerrain(currentSegmentEnd + Vector3.up * terrainRaycastStartHeight, out hitEnd, placementLayerMask))
-                currentSegmentEnd.y = hitEnd.point.y;
-
-            while (currentPathDistance + segmentLength >= nextObjectDistanceTarget)
+            GameObject obj = Instantiate(objectPrefab, initialPos, initialRotation, _currentPlacementParent.transform);
+            if (occupyGrid)
             {
-                float distanceIntoSegment = nextObjectDistanceTarget - currentPathDistance;
-                Vector3 placementPosition = Vector3.Lerp(currentSegmentStart, currentSegmentEnd, distanceIntoSegment / segmentLength);
+                MarkGridCellsOccupied(initialPos, boundsExtents);
+            }
+            placedObjects.Add(obj);
+        }
+
+        for (int i = 1; i < interpolatedPoints.Count; i++)
+        {
+            Vector3 currentPoint = interpolatedPoints[i];
+            float segmentLength = Vector3.Distance(previousPoint, currentPoint);
+            currentDistance += segmentLength;
+
+            while (currentDistance >= effectiveObjectSize)
+            {
+                currentDistance -= effectiveObjectSize;
+
+                // Calculate exact position along the segment
+                float overshoot = effectiveObjectSize - segmentLength + currentDistance; // how much past current point
+                Vector3 position = Vector3.Lerp(currentPoint, previousPoint, overshoot / segmentLength);
 
                 RaycastHit hit;
-                if (RaycastToTerrain(placementPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                if (RaycastToTerrain(position + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
                 {
-                    placementPosition = hit.point;
+                    position.y = hit.point.y;
                 }
                 else
                 {
-                    nextObjectDistanceTarget += effectiveObjectSize;
-                    continue;
+                    continue; // Skip if no terrain found
                 }
 
-                Vector3 direction = (currentSegmentEnd - currentSegmentStart).normalized;
-                if (direction == Vector3.zero) direction = Vector3.forward;
+                Vector3 direction = (currentPoint - previousPoint).normalized;
                 Quaternion objectRotation = Quaternion.LookRotation(direction);
 
-                if (objectsRotatedRightOfLine)
+                if (rotatedRightOfLine)
                 {
                     objectRotation *= Quaternion.Euler(0, 90, 0);
                     Vector3 perpendicularOffset = objectRotation * Vector3.forward * (objectWidth / 2f);
-                    placementPosition += perpendicularOffset;
+                    position += perpendicularOffset;
                 }
 
-                bool isValid = IsValidPlacement(placementPosition, boundsExtents, canOverlap, occupyGrid);
-                if (isValid)
+                if (IsValidPlacement(position, boundsExtents, canOverlap, occupyGrid))
                 {
-                    Instantiate(prefab, placementPosition, objectRotation);
-                    MarkGridOccupied(placementPosition, true);
-                    count++;
+                    GameObject obj = Instantiate(objectPrefab, position, objectRotation, _currentPlacementParent.transform);
+                    if (occupyGrid)
+                    {
+                        MarkGridCellsOccupied(position, boundsExtents);
+                    }
+                    placedObjects.Add(obj);
                 }
-                else
-                {
-                    Debug.LogWarning($"Skipped placing Box Line object at {placementPosition} due to invalid placement rules.");
-                }
-                nextObjectDistanceTarget += effectiveObjectSize;
             }
-            currentPathDistance += segmentLength;
+            previousPoint = currentPoint;
         }
-        return count;
     }
 
-    // Helper to finalize placement for filling a box area
-    private int FinalizeBoxFillPlacement(Vector3 minCorner, Vector3 maxCorner, GameObject prefab, Vector3 boundsExtents, float spacing, bool canOverlap, bool occupyGrid)
+
+    // New: Utility to combine meshes for performance
+    // Takes a list of GameObjects (each with a MeshFilter and MeshRenderer),
+    // combines their meshes into a single new GameObject, and destroys originals.
+    private GameObject CombineMeshes(List<GameObject> objectsToCombine, Material assignedMaterial, string combinedObjectName)
     {
-        if (prefab == null) return 0;
-
-        int count = 0;
-        float objectLength = boundsExtents.z * 2;
-        float objectWidth = boundsExtents.x * 2;
-        float effectiveObjectSizeZ = objectLength + spacing;
-        float effectiveObjectSizeX = objectWidth + spacing;
-
-        for (float x = minCorner.x + effectiveObjectSizeX / 2f; x < maxCorner.x; x += effectiveObjectSizeX)
+        if (objectsToCombine == null || objectsToCombine.Count == 0)
         {
-            for (float z = minCorner.z + effectiveObjectSizeZ / 2f; z < maxCorner.z; z += effectiveObjectSizeZ)
+            Debug.LogWarning("CombineMeshes: No objects provided to combine.");
+            return null;
+        }
+
+        GameObject combinedObject = new GameObject(combinedObjectName);
+        combinedObject.transform.SetParent(_currentPlacementParent.transform); // Set parent to the main placement parent
+        combinedObject.transform.localPosition = Vector3.zero;
+        combinedObject.transform.localRotation = Quaternion.identity;
+        combinedObject.transform.localScale = Vector3.one;
+
+        MeshFilter meshFilter = combinedObject.AddComponent<MeshFilter>();
+        MeshRenderer meshRenderer = combinedObject.AddComponent<MeshRenderer>();
+
+        List<CombineInstance> combineInstances = new List<CombineInstance>();
+
+        foreach (GameObject obj in objectsToCombine)
+        {
+            if (obj == null) continue;
+
+            MeshFilter[] meshFilters = obj.GetComponentsInChildren<MeshFilter>();
+            foreach (MeshFilter mf in meshFilters)
             {
-                Vector3 placementPosition = new Vector3(x, minCorner.y, z);
-
-                RaycastHit hit;
-                if (RaycastToTerrain(placementPosition + Vector3.up * terrainRaycastStartHeight, out hit, placementLayerMask))
+                CombineInstance ci = new CombineInstance
                 {
-                    placementPosition = hit.point;
-                }
-                else
-                {
-                    continue;
-                }
-
-                Quaternion objectRotation = prefab.transform.rotation;
-                if (objectsRotatedRightOfLine)
-                {
-                    objectRotation = Quaternion.Euler(0, 90, 0);
-                }
-
-                bool isValid = IsValidPlacement(placementPosition, boundsExtents, canOverlap, occupyGrid);
-                if (isValid)
-                {
-                    Instantiate(prefab, placementPosition, objectRotation);
-                    MarkGridOccupied(placementPosition, true);
-                    count++;
-                }
-                else
-                {
-                    Debug.LogWarning($"Skipped placing Box Fill object at {placementPosition} due to invalid placement rules.");
-                }
+                    mesh = mf.sharedMesh,
+                    transform = mf.transform.localToWorldMatrix // Use world matrix to combine objects correctly regardless of their original parent
+                };
+                combineInstances.Add(ci);
             }
+            Destroy(obj); // Destroy the original individual object
         }
-        return count;
-    }
 
-    // Helper to enable/disable all placement buttons
-    private void SetAllPlacementButtonsInteractable(bool interactable)
-    {
-        foreach (var entry in placeableObjectEntries)
+        if (combineInstances.Count == 0)
         {
-            if (entry.lineButton != null) entry.lineButton.interactable = interactable; // RENAMED
-            if (entry.boxAndFillButton != null) entry.boxAndFillButton.interactable = interactable; // RENAMED
-            if (entry.lineLoopButton != null) entry.lineLoopButton.interactable = interactable; // RENAMED
-            if (entry.boxLineButton != null) entry.boxLineButton.interactable = interactable; // RENAMED
-            if (entry.boxFillButton != null) entry.boxFillButton.interactable = interactable; // RENAMED
-            if (entry.lineLoopFillButton != null) entry.lineLoopFillButton.interactable = interactable; // RENAMED
-            if (entry.lineCircleButton != null) entry.lineCircleButton.interactable = interactable; // RENAMED
-            if (entry.lineCircleFillButton != null) entry.lineCircleFillButton.interactable = interactable; // NEW
+            Debug.LogWarning("CombineMeshes: No valid meshes found in objects to combine. Destroying empty combined object.");
+            Destroy(combinedObject);
+            return null;
         }
+
+        meshFilter.mesh = new Mesh();
+        meshFilter.mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32; // For larger meshes
+        meshFilter.mesh.CombineMeshes(combineInstances.ToArray(), true, true); // Merge submeshes, use world space
+
+        if (assignedMaterial == null)
+        {
+            Debug.LogError("CombineMeshes: No material found for the combined mesh. It will be invisible. Please ensure your prefab has a MeshRenderer with a material assigned.");
+        }
+        meshRenderer.sharedMaterial = assignedMaterial; // Assign the material
+
+        // Recalculate normals and bounds after combining
+        meshFilter.mesh.RecalculateNormals();
+        meshFilter.mesh.RecalculateBounds();
+        meshFilter.mesh.Optimize(); // Optimize the combined mesh
+
+        Debug.Log($"Combined {objectsToCombine.Count} meshes into a single object: {combinedObject.name}");
+
+        return combinedObject;
     }
 }
