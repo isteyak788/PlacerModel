@@ -221,9 +221,11 @@ public class LineMeshManager : MonoBehaviour
                     GenerateMesh();
                     meshFinalizedForThisInstance = true; // Mark this instance as finalized
                     lineRenderer.enabled = false; // Hide the line for the finished mesh
-                    currentDrawingInstance = null; // IMPORTANT: Clear current drawing so spawner knows to create a new one
+                    // Do NOT set currentDrawingInstance to null here, it's handled after destruction.
                     isDrawingSessionActive = false; // Deactivate session after finalization
-                    Debug.Log(gameObject.name + " mesh finalized. Ready for next mesh.");
+                    Debug.Log(gameObject.name + " mesh finalized.");
+                    // Destroy this LineMeshManager after its job is done
+                    Destroy(this); // <--- IMPORTANT ADDITION
                 }
                 else
                 {
@@ -289,7 +291,10 @@ public class LineMeshManager : MonoBehaviour
         // Create a new GameObject
         GameObject newMeshGO = new GameObject("LineMesh_Instance_" + System.DateTime.Now.ToString("HHmmss"));
 
-        // Add the LineMeshManager component to the new GameObject
+        // Add MeshFilter and MeshRenderer components to the new GameObject (these will persist)
+        newMeshGO.AddComponent<MeshFilter>();
+        newMeshGO.AddComponent<MeshRenderer>();
+        // Add the temporary LineMeshManager component to handle drawing
         LineMeshManager newManager = newMeshGO.AddComponent<LineMeshManager>();
 
         // Ensure components are initialized for the new instance
@@ -313,7 +318,7 @@ public class LineMeshManager : MonoBehaviour
         // Add the very first point to the new manager (this triggers its drawing)
         newManager.AddPoint(firstPoint);
 
-        Debug.Log("New LineMeshManager instance spawned: " + newMeshGO.name);
+        Debug.Log("New LineMeshManager instance spawned for drawing: " + newMeshGO.name);
     }
 
     /// <summary>
@@ -339,6 +344,12 @@ public class LineMeshManager : MonoBehaviour
         meshFinalizedForThisInstance = false;
         // Do NOT set currentDrawingInstance to null here directly, that's spawner's job if it decides to.
         Debug.Log(gameObject.name + " drawing reset.");
+        // If this was a temporary drawing instance, destroy it on reset
+        if (!isSpawner) // Only destroy if it's not the permanent spawner
+        {
+            Destroy(this.gameObject);
+            currentDrawingInstance = null; // Clear the static reference
+        }
     }
 
     /// <summary>
