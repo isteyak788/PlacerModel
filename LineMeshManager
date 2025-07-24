@@ -3,6 +3,7 @@ using UnityEngine;
 using System.Linq; // For .OrderBy and .FirstOrDefault
 using UnityEngine.EventSystems; // Required for UI checks
 using UnityEngine.UI; // REQUIRED for Button type
+using System; // Required for Type
 
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer), typeof(LineRenderer))]
 public class LineMeshManager : MonoBehaviour
@@ -51,6 +52,14 @@ public class LineMeshManager : MonoBehaviour
     [Range(0.0f, 0.89f)] // Max value set to be slightly less than innerLoopScale's max
     public float innermostLoopScale = 0.25f;
 
+    // ***************************************************************
+    // MODIFIED: Use Component[] to allow drag-and-drop for copying
+    // ***************************************************************
+    [Header("Dynamic Components")]
+    [Tooltip("Drag and drop components (e.g., Rigidbody, Collider, your custom scripts) from other GameObjects here. Their type and *serializable* data will be copied to the generated mesh. Note: Only serializable fields will be copied.")]
+    public Component[] componentsToCopy;
+    // ***************************************************************
+
 
     // Internal state for each LineMeshManager instance
     private List<Vector3> controlPoints = new List<Vector3>();
@@ -67,6 +76,12 @@ public class LineMeshManager : MonoBehaviour
 
     // Flag to control if a drawing session is active (for spawner)
     private static bool isDrawingSessionActive = false; // Static to ensure only one session is active globally
+
+
+    // NEW: Reference to the GameObject that will hold the *finalized* mesh.
+    // This is the key to preventing the LineMeshManager from staying on generated meshes.
+    private GameObject finalizedMeshGameObject;
+
 
     void Awake()
     {
@@ -167,13 +182,19 @@ public class LineMeshManager : MonoBehaviour
                         Vector3 newPoint = hit.point + Vector3.up * groundOffset;
 
                         // If no current drawing, or the current one is finalized, spawn a new one
+                        // 'this' refers to the spawner LineMeshManager
                         if (currentDrawingInstance == null || currentDrawingInstance.meshFinalizedForThisInstance)
                         {
-                            SpawnNewMeshGenerator(newPoint);
+                            // The spawner itself becomes the current drawing instance
+                            currentDrawingInstance = this;
+                            // Prepare the spawner for a new drawing session
+                            currentDrawingInstance.ResetDrawingState(); // Clear any previous state
+                            currentDrawingInstance.AddPoint(newPoint); // Add the first point
+                            Debug.Log("Spawner is now the active drawing instance. First point added.");
                         }
                         else
                         {
-                            // If there IS a current drawing, pass the click to it.
+                            // If there IS a current drawing (the spawner itself), pass the click to it.
                             currentDrawingInstance.AddPoint(newPoint);
                         }
                     }
@@ -192,6 +213,8 @@ public class LineMeshManager : MonoBehaviour
                 {
                     currentDrawingInstance.ResetDrawingState();
                     isDrawingSessionActive = false; // Deactivate session on reset
+                    currentDrawingInstance = null; // Clear the static reference
+                    Debug.Log("Spawner: Current drawing reset.");
                 }
                 else if (currentDrawingInstance != null && currentDrawingInstance.meshFinalizedForThisInstance)
                 {
@@ -210,8 +233,8 @@ public class LineMeshManager : MonoBehaviour
         }
         // --- End Spawner Logic ---
 
-        // --- Drawing and Mesh Generation Logic (for all instances that are currentDrawingInstance) ---
-        if (currentDrawingInstance == this)
+        // --- Drawing and Mesh Generation Logic (only for the currentDrawingInstance, which is the spawner) ---
+        if (currentDrawingInstance == this && isDrawingSessionActive) // Added isDrawingSessionActive check
         {
             // Enter key finalizes the current mesh
             if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter))
@@ -221,9 +244,13 @@ public class LineMeshManager : MonoBehaviour
                     GenerateMesh();
                     meshFinalizedForThisInstance = true; // Mark this instance as finalized
                     lineRenderer.enabled = false; // Hide the line for the finished mesh
-                    currentDrawingInstance = null; // IMPORTANT: Clear current drawing so spawner knows to create a new one
+
+                    // Crucially, reset the spawner's state after generating the mesh
+                    // This prepares it for a new drawing session
+                    ResetDrawingState();
+                    currentDrawingInstance = null; // Clear the static reference
                     isDrawingSessionActive = false; // Deactivate session after finalization
-                    Debug.Log(gameObject.name + " mesh finalized. Ready for next mesh.");
+                    Debug.Log(gameObject.name + " mesh finalized and spawner reset. Ready for next mesh.");
                 }
                 else
                 {
@@ -251,6 +278,8 @@ public class LineMeshManager : MonoBehaviour
             {
                 // Set the flag to true, allowing the next left click to spawn a mesh
                 isDrawingSessionActive = true;
+                currentDrawingInstance = this; // The spawner becomes the current drawing instance
+                ResetDrawingState(); // Prepare spawner for new drawing
                 Debug.Log("Drawing session activated. Click on the ground to place the first point.");
             }
             else
@@ -281,40 +310,6 @@ public class LineMeshManager : MonoBehaviour
         UpdateLineRenderer();
     }
 
-    /// <summary>
-    /// Spawns a new LineMeshManager GameObject and sets it as the current drawing instance.
-    /// </summary>
-    private void SpawnNewMeshGenerator(Vector3 firstPoint)
-    {
-        // Create a new GameObject
-        GameObject newMeshGO = new GameObject("LineMesh_Instance_" + System.DateTime.Now.ToString("HHmmss"));
-
-        // Add the LineMeshManager component to the new GameObject
-        LineMeshManager newManager = newMeshGO.AddComponent<LineMeshManager>();
-
-        // Ensure components are initialized for the new instance
-        newManager.InitializeComponents();
-
-        // Copy settings from this (spawner) manager to the new one
-        newManager.pointPrefab = pointPrefab;
-        newManager.meshMaterial = meshMaterial;
-        newManager.lineMaterial = lineMaterial;
-        newManager.lineWidth = lineWidth;
-        newManager.curveSegments = curveSegments;
-        newManager.invertMesh = invertMesh;
-        newManager.groundLayer = groundLayer;
-        newManager.groundOffset = groundOffset;
-        newManager.innerLoopScale = innerLoopScale; // Copy new setting
-        newManager.innermostLoopScale = innermostLoopScale; // Copy new setting
-
-        // Set the new instance as the current active drawing instance
-        currentDrawingInstance = newManager;
-
-        // Add the very first point to the new manager (this triggers its drawing)
-        newManager.AddPoint(firstPoint);
-
-        Debug.Log("New LineMeshManager instance spawned: " + newMeshGO.name);
-    }
 
     /// <summary>
     /// Resets the current drawing state for this specific LineMeshManager instance.
@@ -332,13 +327,21 @@ public class LineMeshManager : MonoBehaviour
         lineRenderer.enabled = true; // Re-enable for new drawing if it was disabled
         if (meshFilter.mesh != null)
         {
-            Destroy(meshFilter.mesh); // Destroy the old mesh asset
-            meshFilter.mesh = null;
+            // IMPORTANT: If this is the spawner, clear its mesh to prepare for new drawing.
+            // But don't destroy the asset if it's already being used by a finalized mesh.
+            if (meshFilter.mesh != null && meshFilter.mesh != finalizedMeshGameObject?.GetComponent<MeshFilter>()?.sharedMesh)
+            {
+                 Destroy(meshFilter.mesh); // Destroy the old mesh asset ONLY if it's not the one already transferred
+            }
+            meshFilter.mesh = null; // Clear the spawner's mesh filter
         }
         meshRenderer.enabled = false;
         meshFinalizedForThisInstance = false;
         // Do NOT set currentDrawingInstance to null here directly, that's spawner's job if it decides to.
         Debug.Log(gameObject.name + " drawing reset.");
+
+        // Clear the reference to the finalized mesh GameObject
+        finalizedMeshGameObject = null;
     }
 
     /// <summary>
@@ -460,7 +463,7 @@ public class LineMeshManager : MonoBehaviour
             return;
         }
 
-        Mesh mesh = new Mesh();
+        Mesh newGeneratedMesh = new Mesh(); // Create a new mesh
         List<Vector3> vertices = new List<Vector3>();
         List<int> triangles = new List<int>();
         List<Vector2> uvs = new List<Vector2>();
@@ -533,7 +536,17 @@ public class LineMeshManager : MonoBehaviour
         }
 
 
-        // Convert to local space for mesh
+        // Create a new GameObject to hold the finalized mesh
+        finalizedMeshGameObject = new GameObject("GeneratedMesh_" + System.DateTime.Now.ToString("HHmmss"));
+        MeshFilter newMeshFilter = finalizedMeshGameObject.AddComponent<MeshFilter>();
+        MeshRenderer newMeshRenderer = finalizedMeshGameObject.AddComponent<MeshRenderer>();
+
+        // Set the position of the new GameObject to match the spawner's position
+        // This ensures the local space transformation is correct.
+        finalizedMeshGameObject.transform.position = this.transform.position;
+
+
+        // Convert to local space for mesh, now relative to the new GameObject's transform
         Vector3[] localSplineVertices = new Vector3[splineMeshPoints.Count];
         Vector3[] localInnerSplineVertices = new Vector3[innerSplinePoints.Count];
         Vector3[] localInnermostSplineVertices = new Vector3[innermostSplinePoints.Count];
@@ -541,9 +554,10 @@ public class LineMeshManager : MonoBehaviour
 
         for (int i = 0; i < splineMeshPoints.Count; i++)
         {
-            localSplineVertices[i] = transform.InverseTransformPoint(splineMeshPoints[i]);
-            localInnerSplineVertices[i] = transform.InverseTransformPoint(innerSplinePoints[i]);
-            localInnermostSplineVertices[i] = transform.InverseTransformPoint(innermostSplinePoints[i]);
+            // Now use finalizedMeshGameObject.transform for InverseTransformPoint
+            localSplineVertices[i] = finalizedMeshGameObject.transform.InverseTransformPoint(splineMeshPoints[i]);
+            localInnerSplineVertices[i] = finalizedMeshGameObject.transform.InverseTransformPoint(innerSplinePoints[i]);
+            localInnermostSplineVertices[i] = finalizedMeshGameObject.transform.InverseTransformPoint(innermostSplinePoints[i]);
         }
 
         // Add all loop vertices
@@ -622,7 +636,8 @@ public class LineMeshManager : MonoBehaviour
         if (innermostLoopScale <= 0.001f) // Innermost loop collapses to centroid
         {
             // Add centroid as the last vertex
-            vertices.Add(transform.InverseTransformPoint(centroid));
+            // Now use finalizedMeshGameObject.transform for InverseTransformPoint
+            vertices.Add(finalizedMeshGameObject.transform.InverseTransformPoint(centroid));
             uvs.Add(new Vector2((centroid.x - minBounds.x) / rangeX, (centroid.z - minBounds.z) / rangeZ)); // UV for centroid
             int centroidIdx = vertices.Count - 1;
 
@@ -645,27 +660,35 @@ public class LineMeshManager : MonoBehaviour
         }
 
 
-        mesh.vertices = vertices.ToArray();
-        mesh.triangles = triangles.ToArray();
-        mesh.uv = uvs.ToArray();
+        newGeneratedMesh.vertices = vertices.ToArray();
+        newGeneratedMesh.triangles = triangles.ToArray();
+        newGeneratedMesh.uv = uvs.ToArray();
 
-        mesh.RecalculateNormals();
-        mesh.RecalculateBounds();
+        newGeneratedMesh.RecalculateNormals();
+        newGeneratedMesh.RecalculateBounds();
 
-        meshFilter.mesh = mesh;
-
+        newMeshFilter.mesh = newGeneratedMesh; // Assign the generated mesh to the new GameObject
         if (meshMaterial != null)
         {
-            meshRenderer.material = meshMaterial;
+            newMeshRenderer.material = meshMaterial;
         }
         else
         {
-            Debug.LogWarning("Mesh material not assigned for " + gameObject.name + ". Using default Standard material.");
-            meshRenderer.material = new Material(Shader.Find("Standard"));
+            Debug.LogWarning("Mesh material not assigned for " + finalizedMeshGameObject.name + ". Using default Standard material.");
+            newMeshRenderer.material = new Material(Shader.Find("Standard"));
         }
 
-        meshRenderer.enabled = true;
-        Debug.Log(gameObject.name + " mesh generated with " + mesh.vertexCount + " vertices and " + mesh.triangles.Length / 3 + " triangles.");
+        // ***************************************************************
+        // MODIFIED: Integrate the new AddComponentsToMeshGameObject method
+        AddComponentsToMeshGameObject(finalizedMeshGameObject);
+        // ***************************************************************
+
+        // The spawner's LineRenderer is now hidden, and its MeshRenderer is also hidden.
+        // The new GameObject will display the mesh.
+        meshRenderer.enabled = false;
+        lineRenderer.enabled = false;
+
+        Debug.Log(finalizedMeshGameObject.name + " mesh generated with " + newGeneratedMesh.vertexCount + " vertices and " + newGeneratedMesh.triangles.Length / 3 + " triangles.");
     }
 
     private void AddTriangle(List<int> list, int v1, int v2, int v3, bool invert)
@@ -683,4 +706,53 @@ public class LineMeshManager : MonoBehaviour
             list.Add(v2);
         }
     }
+
+    // ***************************************************************
+    // MODIFIED: Method to add components and copy data
+    // ***************************************************************
+    private void AddComponentsToMeshGameObject(GameObject targetGameObject)
+    {
+        if (componentsToCopy == null || componentsToCopy.Length == 0)
+        {
+            Debug.Log("No additional components specified to add to " + targetGameObject.name);
+            return;
+        }
+
+        foreach (Component sourceComponent in componentsToCopy)
+        {
+            if (sourceComponent == null)
+            {
+                Debug.LogWarning("Skipping null component in the 'Components To Copy' list. Ensure all slots are filled.");
+                continue;
+            }
+
+            Type componentType = sourceComponent.GetType();
+
+            // Ensure the source is a valid Unity Component type that can be added
+            if (typeof(Component).IsAssignableFrom(componentType) && !componentType.IsAbstract && !componentType.IsInterface)
+            {
+                try
+                {
+                    // 1. Add the new component of the same type
+                    Component newComponent = targetGameObject.AddComponent(componentType);
+
+                    // 2. Attempt to copy serializable data from the source to the new component
+                    // This uses JsonUtility to serialize and then deserialize, effectively copying serializable fields.
+                    string jsonData = JsonUtility.ToJson(sourceComponent);
+                    JsonUtility.FromJsonOverwrite(jsonData, newComponent);
+
+                    Debug.Log($"Added component '{componentType.Name}' to {targetGameObject.name} and attempted to copy its serializable data.");
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"Failed to add or copy component '{componentType.Name}' to {targetGameObject.name}. Error: {e.Message}");
+                }
+            }
+            else
+            {
+                Debug.LogWarning($"The object in 'Components To Copy' slot for '{componentType.Name}' is not a concrete Unity Component type that can be added to a GameObject. Please ensure you are dragging a specific component instance (e.g., Rigidbody, not a generic Component).");
+            }
+        }
+    }
+    // ***************************************************************
 }
