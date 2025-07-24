@@ -52,6 +52,10 @@ public class LineMeshManager : MonoBehaviour
     [Range(0.0f, 0.89f)] // Max value set to be slightly less than innerLoopScale's max
     public float innermostLoopScale = 0.25f;
 
+    // NEW: Toggle for MeshCollider.convex
+    [Tooltip("If true, the MeshCollider will be marked as convex. Convex MeshColliders can interact with other convex colliders.")]
+    public bool makeConvex = false; // Added this line
+
     // ***************************************************************
     // MODIFIED: Use Component[] to allow drag-and-drop for copying
     // ***************************************************************
@@ -540,6 +544,10 @@ public class LineMeshManager : MonoBehaviour
         finalizedMeshGameObject = new GameObject("GeneratedMesh_" + System.DateTime.Now.ToString("HHmmss"));
         MeshFilter newMeshFilter = finalizedMeshGameObject.AddComponent<MeshFilter>();
         MeshRenderer newMeshRenderer = finalizedMeshGameObject.AddComponent<MeshRenderer>();
+        // Add MeshCollider
+        MeshCollider newMeshCollider = finalizedMeshGameObject.AddComponent<MeshCollider>();
+        newMeshCollider.convex = makeConvex; // Set convex based on the public variable [Cite: 1]
+
 
         // Set the position of the new GameObject to match the spawner's position
         // This ensures the local space transformation is correct.
@@ -668,6 +676,8 @@ public class LineMeshManager : MonoBehaviour
         newGeneratedMesh.RecalculateBounds();
 
         newMeshFilter.mesh = newGeneratedMesh; // Assign the generated mesh to the new GameObject
+        newMeshCollider.sharedMesh = newGeneratedMesh; // Assign the mesh to the MeshCollider
+
         if (meshMaterial != null)
         {
             newMeshRenderer.material = meshMaterial;
